@@ -1,0 +1,12 @@
+# Personal Finance — runtime dependencies.
+# Everything here is a local library; none of it phones home.
+
+streamlit>=1.36,<2.0        # user interface
+SQLAlchemy>=2.0,<3.0        # database access (SQLite)
+plotly>=5.18                # interactive charts
+pydantic>=2.5,<3.0          # input validation
+openpyxl>=3.1               # Excel export
+pandas>=2.0                 # tabular editing widgets (also a Streamlit dependency)
+
+# --- development / tests -------------------------------------------------
+pytest>=7.4

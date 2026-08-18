@@ -1,0 +1,68 @@
+# Local-only defaults. Streamlit's usage statistics are switched off.
+#
+# The colours below are generated from ui/palette.py, which is the single source
+# of truth for colour across the whole app — Streamlit's widgets, the custom CSS
+# and the Plotly figures all read it. What is written here is only the *starting*
+# palette; the app re-applies whichever one matches your Theme setting on every
+# run, so switching theme inside the app takes effect immediately.
+#
+# Deliberately NOT written as [theme.light] / [theme.dark] sections: declaring
+# both hands the choice to the browser, and the app's own Theme setting can then
+# no longer change it.
+#
+# Edit ui/palette.py rather than this file, then re-run:
+#     python -c "from ui.palette import write_config; write_config()"
+
+[browser]
+gatherUsageStats = false
+
+[server]
+headless = false
+address = "localhost"
+fileWatcherType = "auto"
+maxUploadSize = 50
+
+[client]
+showSidebarNavigation = false
+toolbarMode = "minimal"
+
+[theme]
+font = "sans serif"
+base = "light"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f5f5f2"
+textColor = "#0b0b0b"
+borderColor = "#e1e0d9"
+primaryColor = "#1a63c4"
+linkColor = "#1a63c4"
+codeBackgroundColor = "#f5f5f2"
+codeTextColor = "#52514e"
+dataframeHeaderBackgroundColor = "#f5f5f2"
+dataframeBorderColor = "#e1e0d9"
+showWidgetBorder = true
+greenColor = "#146c2e"
+greenTextColor = "#146c2e"
+greenBackgroundColor = "#e7f5e7"
+redColor = "#c5221f"
+redTextColor = "#c5221f"
+redBackgroundColor = "#fbe9e9"
+yellowColor = "#8a5d00"
+yellowTextColor = "#8a5d00"
+yellowBackgroundColor = "#fdf3dd"
+orangeColor = "#8a5d00"
+orangeTextColor = "#8a5d00"
+orangeBackgroundColor = "#fdf3dd"
+blueColor = "#1a63c4"
+blueTextColor = "#1a63c4"
+blueBackgroundColor = "#e8f0fc"
+grayColor = "#898781"
+grayTextColor = "#52514e"
+grayBackgroundColor = "#f5f5f2"
+
+[theme.sidebar]
+backgroundColor = "#f8f8f6"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#0b0b0b"
+borderColor = "#e1e0d9"
+primaryColor = "#1a63c4"
+linkColor = "#1a63c4"
