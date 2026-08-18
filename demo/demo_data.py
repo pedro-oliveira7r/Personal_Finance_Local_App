@@ -61,22 +61,22 @@ DEMO_TAG = "demo"
 # Account and rule definitions
 # --------------------------------------------------------------------------
 DEMO_ACCOUNTS = [
-    dict(name="Conta Corrente", type=AccountType.CHECKING.value, icon="🏦",
-         opening_balance="3200", institution="Banco do Brasil", color="#2a78d6"),
-    dict(name="Poupança", type=AccountType.SAVINGS.value, icon="🐖",
-         opening_balance="6500", institution="Banco do Brasil", color="#1baf7a"),
-    dict(name="Carteira", type=AccountType.CASH.value, icon="👛",
+    dict(name="Main checking", type=AccountType.CHECKING.value, icon="🏦",
+         opening_balance="3200", institution="First National Bank", color="#2a78d6"),
+    dict(name="Savings", type=AccountType.SAVINGS.value, icon="🐖",
+         opening_balance="6500", institution="First National Bank", color="#1baf7a"),
+    dict(name="Wallet", type=AccountType.CASH.value, icon="👛",
          opening_balance="250", color="#eda100"),
-    dict(name="Cartão de Crédito", type=AccountType.CREDIT_CARD.value, icon="💳",
+    dict(name="Credit card", type=AccountType.CREDIT_CARD.value, icon="💳",
          opening_balance="1850", credit_limit="9000",
          statement_day=28, due_day=10, include_in_cash=False, color="#e34948"),
-    dict(name="Investimentos", type=AccountType.INVESTMENT.value, icon="📊",
-         opening_balance="18400", institution="XP", include_in_cash=False,
+    dict(name="Investments", type=AccountType.INVESTMENT.value, icon="📊",
+         opening_balance="18400", institution="Meridian Brokerage", include_in_cash=False,
          interest_rate="10.5", color="#4a3aa7"),
-    dict(name="Financiamento do Carro", type=AccountType.LOAN.value, icon="🚗",
+    dict(name="Car loan", type=AccountType.LOAN.value, icon="🚗",
          opening_balance="31500", interest_rate="21.9", due_day=15,
          include_in_cash=False, color="#eb6834"),
-    dict(name="Apartamento", type=AccountType.OTHER_ASSET.value, icon="🏠",
+    dict(name="Apartment", type=AccountType.OTHER_ASSET.value, icon="🏠",
          opening_balance="0", balance_mode="manual", include_in_cash=False,
          color="#008300"),
 ]
@@ -85,177 +85,177 @@ DEMO_ACCOUNTS = [
 #: ``skip`` is the chance the payment simply did not happen that month.
 DEMO_RULES: list[dict[str, Any]] = [
     # ---- income -------------------------------------------------------
-    dict(name="Salário", kind="income", amount="11400", category="Salary › Net salary",
-         account="Conta Corrente", frequency=Frequency.MONTHLY.value, day_of_month=5,
+    dict(name="Salary", kind="income", amount="11400", category="Salary › Net salary",
+         account="Main checking", frequency=Frequency.MONTHLY.value, day_of_month=5,
          growth_pct="6", growth_anchor_month=1, jitter=0.0,
          business_day_rule=BusinessDayRule.PREVIOUS.value,
-         description_template="Salário {month}/{year}"),
-    dict(name="13º salário", kind="income", amount="11400", category="Salary › 13th salary",
-         account="Conta Corrente", frequency=Frequency.ANNUAL.value,
+         description_template="Salary {month}/{year}"),
+    dict(name="13th salary", kind="income", amount="11400", category="Salary › 13th salary",
+         account="Main checking", frequency=Frequency.ANNUAL.value,
          month_of_year=12, day_of_month=20, growth_pct="6", growth_anchor_month=1,
          jitter=0.0),
     dict(name="Freelance (design)", kind="income", amount="1800",
-         category="Freelance › Projects", account="Conta Corrente",
+         category="Freelance › Projects", account="Main checking",
          frequency=Frequency.CUSTOM_MONTHS.value, interval=2, day_of_month=18,
          jitter=0.45, skip=0.25, settlement_offset_days=12,
          description_template="Freelance {month}/{year}"),
-    dict(name="Rendimento de investimentos", kind="income", amount="145",
-         category="Investment income › Dividends", account="Investimentos",
+    dict(name="Investment income", kind="income", amount="145",
+         category="Investment income › Dividends", account="Investments",
          frequency=Frequency.MONTHLY.value, day_of_month=15, growth_pct="1.5",
          growth_every_months=6, jitter=0.30),
 
     # ---- housing ------------------------------------------------------
-    dict(name="Aluguel", kind="expense", amount="2200", category="Housing › Rent",
-         account="Conta Corrente", frequency=Frequency.MONTHLY.value, day_of_month=10,
+    dict(name="Rent", kind="expense", amount="2200", category="Housing › Rent",
+         account="Main checking", frequency=Frequency.MONTHLY.value, day_of_month=10,
          growth_pct="8", growth_anchor_month=3, jitter=0.0),
-    dict(name="Condomínio", kind="expense", amount="480",
-         category="Housing › Condo fee", account="Conta Corrente",
+    dict(name="Condo fee", kind="expense", amount="480",
+         category="Housing › Condo fee", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=10, growth_pct="5",
          growth_anchor_month=1, jitter=0.02),
-    dict(name="IPTU", kind="expense", amount="420",
-         category="Housing › Property tax", account="Conta Corrente",
+    dict(name="Property tax", kind="expense", amount="420",
+         category="Housing › Property tax", account="Main checking",
          frequency=Frequency.QUARTERLY.value, month_of_year=1, day_of_month=20,
          jitter=0.0),
 
     # ---- utilities ----------------------------------------------------
-    dict(name="Energia elétrica", kind="expense", amount="185",
-         category="Utilities › Electricity", account="Conta Corrente",
+    dict(name="Electricity", kind="expense", amount="185",
+         category="Utilities › Electricity", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=14,
          seasonal_factors={"1": 1.5, "2": 1.5, "3": 1.3, "6": 0.8, "7": 0.75, "12": 1.35},
          jitter=0.12),
-    dict(name="Água", kind="expense", amount="92", category="Utilities › Water & sewage",
-         account="Conta Corrente", frequency=Frequency.MONTHLY.value, day_of_month=16,
+    dict(name="Water", kind="expense", amount="92", category="Utilities › Water & sewage",
+         account="Main checking", frequency=Frequency.MONTHLY.value, day_of_month=16,
          jitter=0.10),
-    dict(name="Internet fibra", kind="expense", amount="119",
-         category="Utilities › Internet", account="Conta Corrente",
+    dict(name="Internet", kind="expense", amount="119",
+         category="Utilities › Internet", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=8, growth_pct="7",
          growth_anchor_month=9, jitter=0.0),
-    dict(name="Celular", kind="expense", amount="59", category="Utilities › Mobile phone",
-         account="Cartão de Crédito", frequency=Frequency.MONTHLY.value, day_of_month=22,
+    dict(name="Mobile phone", kind="expense", amount="59", category="Utilities › Mobile phone",
+         account="Credit card", frequency=Frequency.MONTHLY.value, day_of_month=22,
          jitter=0.05),
 
     # ---- food ---------------------------------------------------------
-    dict(name="Supermercado", kind="expense", amount="1280", category="Food › Groceries",
-         account="Conta Corrente", frequency=Frequency.MONTHLY.value, day_of_month=6,
+    dict(name="Groceries", kind="expense", amount="1280", category="Food › Groceries",
+         account="Main checking", frequency=Frequency.MONTHLY.value, day_of_month=6,
          growth_pct="4", growth_anchor_month=1, jitter=0.18),
-    dict(name="Restaurantes", kind="expense", amount="430", category="Food › Restaurants",
-         account="Cartão de Crédito", frequency=Frequency.MONTHLY.value, day_of_month=20,
+    dict(name="Restaurants", kind="expense", amount="430", category="Food › Restaurants",
+         account="Credit card", frequency=Frequency.MONTHLY.value, day_of_month=20,
          jitter=0.35),
     dict(name="Delivery", kind="expense", amount="215", category="Food › Delivery",
-         account="Cartão de Crédito", frequency=Frequency.MONTHLY.value, day_of_month=25,
+         account="Credit card", frequency=Frequency.MONTHLY.value, day_of_month=25,
          jitter=0.40),
 
     # ---- transport ----------------------------------------------------
-    dict(name="Combustível", kind="expense", amount="390",
-         category="Transportation › Fuel", account="Conta Corrente",
+    dict(name="Fuel", kind="expense", amount="390",
+         category="Transportation › Fuel", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=4, growth_pct="5",
          growth_anchor_month=1, jitter=0.22),
-    dict(name="Transporte público", kind="expense", amount="110",
-         category="Transportation › Public transport", account="Carteira",
+    dict(name="Public transport", kind="expense", amount="110",
+         category="Transportation › Public transport", account="Wallet",
          frequency=Frequency.MONTHLY.value, day_of_month=2, jitter=0.20),
-    dict(name="Seguro do carro", kind="expense", amount="2380",
-         category="Transportation › Vehicle insurance", account="Conta Corrente",
+    dict(name="Car insurance", kind="expense", amount="2380",
+         category="Transportation › Vehicle insurance", account="Main checking",
          frequency=Frequency.ANNUAL.value, month_of_year=3, day_of_month=15,
          growth_pct="9", growth_anchor_month=3, jitter=0.0),
-    dict(name="Manutenção do carro", kind="expense", amount="480",
-         category="Transportation › Vehicle maintenance", account="Conta Corrente",
+    dict(name="Car maintenance", kind="expense", amount="480",
+         category="Transportation › Vehicle maintenance", account="Main checking",
          frequency=Frequency.SEMIANNUAL.value, month_of_year=4, day_of_month=12,
          jitter=0.5),
 
     # ---- health & insurance -------------------------------------------
-    dict(name="Plano de saúde", kind="expense", amount="612",
-         category="Healthcare › Health insurance", account="Conta Corrente",
+    dict(name="Health insurance", kind="expense", amount="612",
+         category="Healthcare › Health insurance", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=12, growth_pct="11",
          growth_anchor_month=6, jitter=0.0),
-    dict(name="Academia", kind="expense", amount="129",
-         category="Healthcare › Gym & fitness", account="Cartão de Crédito",
+    dict(name="Gym", kind="expense", amount="129",
+         category="Healthcare › Gym & fitness", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=3, jitter=0.0, skip=0.08),
-    dict(name="Farmácia", kind="expense", amount="140",
-         category="Healthcare › Medication", account="Cartão de Crédito",
+    dict(name="Pharmacy", kind="expense", amount="140",
+         category="Healthcare › Medication", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=17, jitter=0.45),
 
     # ---- subscriptions ------------------------------------------------
-    dict(name="Streaming (vídeo)", kind="expense", amount="44.90",
-         category="Subscriptions › Streaming", account="Cartão de Crédito",
+    dict(name="Streaming (video)", kind="expense", amount="44.90",
+         category="Subscriptions › Streaming", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=7, growth_pct="12",
          growth_every_months=6, jitter=0.0),
-    dict(name="Streaming (música)", kind="expense", amount="21.90",
-         category="Subscriptions › Streaming", account="Cartão de Crédito",
+    dict(name="Streaming (music)", kind="expense", amount="21.90",
+         category="Subscriptions › Streaming", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=9, jitter=0.0),
-    dict(name="Software / nuvem", kind="expense", amount="63",
-         category="Subscriptions › Software", account="Cartão de Crédito",
+    dict(name="Software / cloud", kind="expense", amount="63",
+         category="Subscriptions › Software", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=11, jitter=0.0),
 
     # ---- lifestyle ----------------------------------------------------
-    dict(name="Lazer e cultura", kind="expense", amount="260",
-         category="Entertainment › Events & shows", account="Cartão de Crédito",
+    dict(name="Leisure & culture", kind="expense", amount="260",
+         category="Entertainment › Events & shows", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=21, jitter=0.55, skip=0.15),
-    dict(name="Vestuário", kind="expense", amount="320",
-         category="Shopping › Clothing & shoes", account="Cartão de Crédito",
+    dict(name="Clothing", kind="expense", amount="320",
+         category="Shopping › Clothing & shoes", account="Credit card",
          frequency=Frequency.CUSTOM_MONTHS.value, interval=2, day_of_month=19,
          jitter=0.6, skip=0.2),
-    dict(name="Pet (ração e vet)", kind="expense", amount="185",
-         category="Pets › Pet food", account="Cartão de Crédito",
+    dict(name="Pet (food & vet)", kind="expense", amount="185",
+         category="Pets › Pet food", account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=13, jitter=0.25),
-    dict(name="Curso de inglês", kind="expense", amount="349",
-         category="Education › Languages", account="Conta Corrente",
+    dict(name="Language course", kind="expense", amount="349",
+         category="Education › Languages", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=15, jitter=0.0,
          months_active=10),
-    dict(name="Viagem de julho", kind="expense", amount="4600",
-         category="Travel › Accommodation", account="Cartão de Crédito",
+    dict(name="July vacation", kind="expense", amount="4600",
+         category="Travel › Accommodation", account="Credit card",
          frequency=Frequency.ANNUAL.value, month_of_year=7, day_of_month=8,
          growth_pct="10", growth_anchor_month=7, jitter=0.18),
 
     # ---- taxes & fees -------------------------------------------------
-    dict(name="Imposto trimestral (autônomo)", kind="expense", amount="640",
-         category="Taxes › Income tax", account="Conta Corrente",
+    dict(name="Quarterly tax (self-employed)", kind="expense", amount="640",
+         category="Taxes › Income tax", account="Main checking",
          frequency=Frequency.QUARTERLY.value, month_of_year=2, day_of_month=20,
          jitter=0.15),
-    dict(name="Tarifas bancárias", kind="expense", amount="34.90",
-         category="Fees & banking › Bank fees", account="Conta Corrente",
+    dict(name="Bank fees", kind="expense", amount="34.90",
+         category="Fees & banking › Bank fees", account="Main checking",
          frequency=Frequency.MONTHLY.value, day_of_month=28, jitter=0.0),
 
     # ---- savings, investments, debt ----------------------------------
-    dict(name="Reserva de emergência", kind="transfer", amount="700",
-         account="Conta Corrente", to_account="Poupança",
+    dict(name="Emergency fund", kind="transfer", amount="700",
+         account="Main checking", to_account="Savings",
          frequency=Frequency.MONTHLY.value, day_of_month=6, jitter=0.0,
-         goal="Reserva de emergência"),
-    dict(name="Aporte em investimentos", kind="transfer", amount="1400",
-         account="Conta Corrente", to_account="Investimentos",
+         goal="Emergency fund"),
+    dict(name="Investment contribution", kind="transfer", amount="1400",
+         account="Main checking", to_account="Investments",
          frequency=Frequency.MONTHLY.value, day_of_month=6, jitter=0.12,
-         goal="Entrada do apartamento"),
-    dict(name="Reserva da viagem", kind="transfer", amount="300",
-         account="Conta Corrente", to_account="Poupança",
+         goal="Apartment down payment"),
+    dict(name="Vacation savings", kind="transfer", amount="300",
+         account="Main checking", to_account="Savings",
          frequency=Frequency.MONTHLY.value, day_of_month=6, jitter=0.0,
-         goal="Viagem de férias"),
-    dict(name="Saque para carteira", kind="transfer", amount="200",
-         account="Conta Corrente", to_account="Carteira",
+         goal="Vacation trip"),
+    dict(name="Cash withdrawal", kind="transfer", amount="200",
+         account="Main checking", to_account="Wallet",
          frequency=Frequency.MONTHLY.value, day_of_month=2, jitter=0.15),
-    dict(name="Parcela do financiamento", kind="transfer", amount="948",
-         account="Conta Corrente", to_account="Financiamento do Carro",
+    dict(name="Car loan payment", kind="transfer", amount="948",
+         account="Main checking", to_account="Car loan",
          frequency=Frequency.MONTHLY.value, day_of_month=15, jitter=0.0,
-         debt="Financiamento do Carro"),
-    dict(name="Pagamento do cartão", kind="transfer", amount="2350",
-         account="Conta Corrente", to_account="Cartão de Crédito",
+         debt="Car loan"),
+    dict(name="Credit card payment", kind="transfer", amount="2350",
+         account="Main checking", to_account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=10, jitter=0.15,
-         debt="Cartão de Crédito", include_in_budget=False),
+         debt="Credit card", include_in_budget=False),
 ]
 
 DEMO_GOALS = [
-    dict(name="Reserva de emergência", goal_type=GoalType.EMERGENCY_FUND.value,
+    dict(name="Emergency fund", goal_type=GoalType.EMERGENCY_FUND.value,
          target_amount="36000", starting_amount="6500", planned_monthly="700",
-         account="Poupança", priority=1, icon="🚨",
+         account="Savings", priority=1, icon="🚨",
          target_date_offset_months=30,
          notes="Six months of core expenses."),
-    dict(name="Viagem de férias", goal_type=GoalType.VACATION.value,
+    dict(name="Vacation trip", goal_type=GoalType.VACATION.value,
          target_amount="9000", starting_amount="0", planned_monthly="300",
-         account="Poupança", priority=3, icon="✈️",
+         account="Savings", priority=3, icon="✈️",
          target_date_offset_months=11),
-    dict(name="Entrada do apartamento", goal_type=GoalType.HOME_DOWN_PAYMENT.value,
+    dict(name="Apartment down payment", goal_type=GoalType.HOME_DOWN_PAYMENT.value,
          target_amount="80000", starting_amount="18400", planned_monthly="1400",
-         account="Investimentos", priority=2, icon="🏠",
+         account="Investments", priority=2, icon="🏠",
          target_date_offset_months=60),
-    dict(name="Troca do carro", goal_type=GoalType.VEHICLE.value,
+    dict(name="Car replacement", goal_type=GoalType.VEHICLE.value,
          target_amount="25000", starting_amount="0", planned_monthly="0",
          priority=5, icon="🚙", target_date_offset_months=42,
          notes="No contributions yet — deliberately behind, to show the alert."),
@@ -265,34 +265,34 @@ DEMO_DEBTS = [
     # ``include_in_budget=False``: the spending charged to this card is already
     # budgeted category by category, so giving the payment its own allocation
     # would claim the same money twice.
-    dict(name="Cartão de Crédito", debt_type=DebtType.CREDIT_CARD.value,
+    dict(name="Credit card", debt_type=DebtType.CREDIT_CARD.value,
          principal_balance="1850", interest_rate="180", minimum_payment="280",
-         planned_payment="3200", due_day=10, account="Cartão de Crédito",
+         planned_payment="3200", due_day=10, account="Credit card",
          include_in_budget=False),
-    dict(name="Financiamento do Carro", debt_type=DebtType.CAR_LOAN.value,
+    dict(name="Car loan", debt_type=DebtType.CAR_LOAN.value,
          principal_balance="31500", original_principal="42000",
          interest_rate="21.9", minimum_payment="948", planned_payment="948",
-         extra_payment="100", due_day=15, account="Financiamento do Carro"),
+         extra_payment="100", due_day=15, account="Car loan"),
 ]
 
 #: One-off surprises, as (month offset from the first demo month, payload).
 DEMO_ONE_OFFS = [
-    (2, dict(description="Conserto da geladeira", amount="820",
-             category="Housing › Repairs & maintenance", account="Cartão de Crédito")),
-    (5, dict(description="Presente de aniversário", amount="360",
-             category="Family & gifts › Donations", account="Cartão de Crédito")),
-    (7, dict(description="Multa de trânsito", amount="195",
-             category="Transportation › Tolls", account="Conta Corrente")),
-    (9, dict(description="Dentista (canal)", amount="1450",
-             category="Healthcare › Doctor & dentist", account="Conta Corrente")),
-    (11, dict(description="Notebook novo", amount="4200",
-              category="Shopping › Electronics", account="Cartão de Crédito")),
-    (13, dict(description="Restituição do IR", amount="1780", kind="income",
-              category="Government benefits › Tax refund", account="Conta Corrente")),
-    (15, dict(description="Venda de móveis usados", amount="650", kind="income",
-              category="Other income", account="Carteira")),
-    (16, dict(description="Pneus novos", amount="1980",
-              category="Transportation › Vehicle maintenance", account="Conta Corrente")),
+    (2, dict(description="Fridge repair", amount="820",
+             category="Housing › Repairs & maintenance", account="Credit card")),
+    (5, dict(description="Birthday present", amount="360",
+             category="Family & gifts › Donations", account="Credit card")),
+    (7, dict(description="Traffic fine", amount="195",
+             category="Transportation › Tolls", account="Main checking")),
+    (9, dict(description="Dentist (root canal)", amount="1450",
+             category="Healthcare › Doctor & dentist", account="Main checking")),
+    (11, dict(description="New laptop", amount="4200",
+              category="Shopping › Electronics", account="Credit card")),
+    (13, dict(description="Tax refund", amount="1780", kind="income",
+              category="Government benefits › Tax refund", account="Main checking")),
+    (15, dict(description="Sale of used furniture", amount="650", kind="income",
+              category="Other income", account="Wallet")),
+    (16, dict(description="New tires", amount="1980",
+              category="Transportation › Vehicle maintenance", account="Main checking")),
 ]
 
 PROPERTY_VALUATIONS = [(0, "365000"), (6, "372000"), (12, "384000"), (17, "391500")]
@@ -322,9 +322,161 @@ class DemoReport:
 
 
 # --------------------------------------------------------------------------
+# Translating a book that was seeded before this dataset spoke English
+# --------------------------------------------------------------------------
+#: The names this dataset used to ship with, paired with what they are now.
+#: Ordered longest phrase first so "Cartão de Crédito" is never half-rewritten
+#: by a shorter key that happens to sit inside it.
+LEGACY_NAMES: tuple[tuple[str, str], ...] = (
+    # accounts
+    ("Financiamento do Carro", "Car loan"),
+    ("Cartão de Crédito", "Credit card"),
+    ("Conta Corrente", "Main checking"),
+    ("Banco do Brasil", "First National Bank"),
+    ("Investimentos", "Investments"),
+    ("Apartamento", "Apartment"),
+    ("Poupança", "Savings"),
+    ("Carteira", "Wallet"),
+    ("XP", "Meridian Brokerage"),
+    # income
+    ("Rendimento de investimentos", "Investment income"),
+    ("13º salário", "13th salary"),
+    ("Salário", "Salary"),
+    # housing and utilities
+    ("Energia elétrica", "Electricity"),
+    ("Internet fibra", "Internet"),
+    ("Condomínio", "Condo fee"),
+    ("Aluguel", "Rent"),
+    ("Celular", "Mobile phone"),
+    ("Água", "Water"),
+    ("IPTU", "Property tax"),
+    # food
+    ("Supermercado", "Groceries"),
+    ("Restaurantes", "Restaurants"),
+    # transport
+    ("Manutenção do carro", "Car maintenance"),
+    ("Transporte público", "Public transport"),
+    ("Seguro do carro", "Car insurance"),
+    ("Combustível", "Fuel"),
+    # health
+    ("Plano de saúde", "Health insurance"),
+    ("Farmácia", "Pharmacy"),
+    ("Academia", "Gym"),
+    # subscriptions and lifestyle
+    ("Imposto trimestral (autônomo)", "Quarterly tax (self-employed)"),
+    ("Streaming (vídeo)", "Streaming (video)"),
+    ("Streaming (música)", "Streaming (music)"),
+    ("Software / nuvem", "Software / cloud"),
+    ("Pet (ração e vet)", "Pet (food & vet)"),
+    ("Lazer e cultura", "Leisure & culture"),
+    ("Curso de inglês", "Language course"),
+    ("Tarifas bancárias", "Bank fees"),
+    ("Viagem de julho", "July vacation"),
+    ("Vestuário", "Clothing"),
+    # transfers
+    ("Aporte em investimentos", "Investment contribution"),
+    ("Parcela do financiamento", "Car loan payment"),
+    ("Pagamento do cartão", "Credit card payment"),
+    ("Saque para carteira", "Cash withdrawal"),
+    ("Reserva da viagem", "Vacation savings"),
+    # goals
+    ("Entrada do apartamento", "Apartment down payment"),
+    ("Reserva de emergência", "Emergency fund"),
+    ("Viagem de férias", "Vacation trip"),
+    ("Troca do carro", "Car replacement"),
+    # one-offs
+    ("Venda de móveis usados", "Sale of used furniture"),
+    ("Presente de aniversário", "Birthday present"),
+    ("Conserto da geladeira", "Fridge repair"),
+    ("Dentista (canal)", "Dentist (root canal)"),
+    ("Restituição do IR", "Tax refund"),
+    ("Multa de trânsito", "Traffic fine"),
+    ("Notebook novo", "New laptop"),
+    ("Pneus novos", "New tires"),
+)
+
+#: Where those names can be sitting. ``Transaction.description`` is the one that
+#: needs a substring pass rather than a whole-value swap, because interest rows
+#: read "Interest · <account> · 08/2026" and salary rows "Salário 08/2026".
+_TRANSLATABLE_FIELDS = (
+    (Account, ("name", "institution")),
+    (RecurringRule, ("name", "description_template")),
+    (Goal, ("name",)),
+    (Debt, ("name",)),
+    (Transaction, ("description",)),
+)
+
+
+def translate_text(value: Optional[str]) -> Optional[str]:
+    """Rewrite any known legacy phrase inside ``value``."""
+    if not value:
+        return value
+    for old, new in LEGACY_NAMES:
+        if old in value:
+            value = value.replace(old, new)
+    return value
+
+
+def needs_translation(session: Session) -> bool:
+    """Cheap check: does this book still hold any of the old names?
+
+    Runs on every launch, so it stays to the four small tables and never scans
+    the transactions.
+    """
+    from sqlalchemy import or_
+
+    for model, fields in _TRANSLATABLE_FIELDS:
+        if model is Transaction:
+            continue
+        column = getattr(model, "name")
+        clauses = [column.like(f"%{old}%") for old, _ in LEGACY_NAMES]
+        if session.execute(select(model.id).where(or_(*clauses)).limit(1)).first():
+            return True
+    return False
+
+
+def translate_legacy_data(session: Session) -> dict[str, int]:
+    """Bring a book seeded before this dataset spoke English up to date.
+
+    Editing the definitions above only changes what a *fresh* install receives;
+    a database seeded earlier keeps the Portuguese it was given. This rewrites
+    those rows in place.
+
+    It replaces whole known phrases only, so anything typed by hand survives
+    untouched, and it is a no-op once there is nothing left to rename — which
+    makes it safe to call on every launch.
+    """
+    changed: dict[str, int] = {}
+    for model, fields in _TRANSLATABLE_FIELDS:
+        rows = session.execute(select(model)).scalars().all()
+        for row in rows:
+            touched = False
+            for field in fields:
+                before = getattr(row, field, None)
+                after = translate_text(before)
+                if after != before:
+                    setattr(row, field, after)
+                    touched = True
+            if touched:
+                if model is Transaction:
+                    # The duplicate-import guard hashes the description, so a
+                    # renamed row needs its fingerprint recomputed or it would
+                    # no longer match itself.
+                    row.fingerprint = fingerprint(
+                        row.txn_date, row.amount, row.description or "",
+                        row.account_id, row.kind)
+                changed[model.__name__] = changed.get(model.__name__, 0) + 1
+    session.flush()
+    return changed
+
+
+# --------------------------------------------------------------------------
 def has_demo_data(session: Session) -> bool:
+    """True when the demo dataset is present, in either language."""
     return session.execute(
-        select(RecurringRule.id).where(RecurringRule.name == "Salário").limit(1)
+        select(RecurringRule.id)
+        .where(RecurringRule.name.in_(("Salary", "Salário")))
+        .limit(1)
     ).first() is not None
 
 
@@ -642,7 +794,7 @@ def _accrue_loan_interest(session: Session, accounts: dict[str, Account],
     """A financed car shrinks by payment minus interest, not by the payment."""
     from services import account_service
 
-    loan = accounts.get("Financiamento do Carro")
+    loan = accounts.get("Car loan")
     if loan is None:
         return
     result = account_service.accrue_interest(
@@ -658,7 +810,7 @@ def _add_valuations(session: Session, accounts: dict[str, Account],
     With a short demo window several offsets can clamp onto the same day; the
     latest value for a given date wins rather than causing a collision.
     """
-    apartment = accounts.get("Apartamento")
+    apartment = accounts.get("Apartment")
     if apartment is None:
         return
     planned: dict[date, str] = {}

@@ -6,6 +6,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import select
 
 from calculations.periods import make_period, shift_period
 from constants import CategoryKind, Frequency, PeriodStatus, TxnKind, TxnStatus
@@ -870,3 +871,153 @@ def test_recurring_patterns_need_repetition(session, accounts, categories):
     labels = {row["label"] for row in patterns}
     assert any("Groceries" in label for label in labels)
     assert not any("Rent" in label for label in labels)
+
+
+# --------------------------------------------------------------------------
+# Language
+# --------------------------------------------------------------------------
+#: Characters that only appear in the Portuguese the dataset used to ship with.
+PORTUGUESE_CHARS = set("áàâãéêíóôõúüçÁÀÂÃÉÊÍÓÔÕÚÜÇº")
+
+#: Whole words that would betray Portuguese without needing an accent.
+PORTUGUESE_WORDS = (
+    "conta", "cartao", "credito", "poupanca", "carteira", "aluguel",
+    "supermercado", "salario", "viagem", "reserva", "pagamento", "parcela",
+    "seguro", "imposto", "financiamento", "apartamento", "geladeira",
+)
+
+
+def _demo_strings(session):
+    """Every string the demo dataset puts in front of a person."""
+    from database.models import Account, Debt, Goal, RecurringRule, Transaction
+
+    fields = [
+        (Account, ("name", "institution")),
+        (RecurringRule, ("name", "description_template")),
+        (Goal, ("name", "notes")),
+        (Debt, ("name",)),
+        (Transaction, ("description", "tags")),
+    ]
+    seen = set()
+    for model, names in fields:
+        for row in session.execute(select(model)).scalars():
+            for field in names:
+                value = getattr(row, field, None)
+                if value:
+                    seen.add(f"{model.__name__}.{field}: {value}")
+    return seen
+
+
+def test_demo_data_is_written_in_english(session):
+    """No accented characters, and no give-away Portuguese words either."""
+    from demo.demo_data import load_demo_data
+
+    load_demo_data(session, months_back=6, months_forward=2,
+                   today=date(2026, 8, 17))
+    session.commit()
+
+    values = _demo_strings(session)
+    assert values, "the demo dataset produced no text at all"
+
+    accented = [v for v in values if PORTUGUESE_CHARS & set(v)]
+    assert not accented, "accented Portuguese left in the demo data:\n" + "\n".join(accented)
+
+    worded = [v for v in values
+              if any(word in v.split(": ", 1)[1].lower() for word in PORTUGUESE_WORDS)]
+    assert not worded, "Portuguese words left in the demo data:\n" + "\n".join(worded)
+
+
+def test_a_portuguese_book_translates_itself(session):
+    """The path a person upgrading actually takes.
+
+    Their database was seeded when the dataset was still Portuguese, so editing
+    the definitions does nothing for them — the rows have to be rewritten in
+    place, without disturbing a single balance or link.
+    """
+    from demo.demo_data import (
+        LEGACY_NAMES,
+        _TRANSLATABLE_FIELDS,
+        has_demo_data,
+        load_demo_data,
+        needs_translation,
+        translate_legacy_data,
+    )
+    from services import account_service
+
+    load_demo_data(session, months_back=6, months_forward=2,
+                   today=date(2026, 8, 17))
+    session.commit()
+    before = account_service.totals(account_service.balance_views(session))
+
+    # Put the book back into Portuguese, exactly as an older install holds it.
+    reverse = [(new, old) for old, new in LEGACY_NAMES]
+    for model, fields in _TRANSLATABLE_FIELDS:
+        for row in session.execute(select(model)).scalars():
+            for field in fields:
+                value = getattr(row, field, None)
+                if not value:
+                    continue
+                for new, old in reverse:
+                    value = value.replace(new, old)
+                setattr(row, field, value)
+    session.commit()
+    assert needs_translation(session)
+    assert has_demo_data(session), "the old name must still count as demo data"
+
+    changed = translate_legacy_data(session)
+    session.commit()
+    assert changed["Account"] and changed["Transaction"]
+
+    values = _demo_strings(session)
+    accented = [v for v in values if PORTUGUESE_CHARS & set(v)]
+    assert not accented, "translation missed:\n" + "\n".join(accented)
+
+    # Idempotent, and nothing financial moved.
+    assert not needs_translation(session)
+    assert translate_legacy_data(session) == {}
+    after = account_service.totals(account_service.balance_views(session))
+    assert after.net_worth == before.net_worth
+    assert after.cash == before.cash
+    assert after.liabilities == before.liabilities
+
+
+def test_translation_leaves_a_persons_own_entries_alone(session):
+    """Only the known demo phrases are rewritten — nothing else is touched."""
+    from demo.demo_data import translate_legacy_data, translate_text
+
+    assert translate_text("Conta Corrente") == "Main checking"
+    assert translate_text("Interest · Cartão de Crédito · 08/2026") == \
+        "Interest · Credit card · 08/2026"
+    # A person's own words, in either language, pass through unchanged.
+    assert translate_text("Lunch with Ana") == "Lunch with Ana"
+    assert translate_text("Consulta veterinária") == "Consulta veterinária"
+    assert translate_text(None) is None
+    assert translate_text("") == ""
+
+    # And on an empty book it does nothing at all.
+    assert translate_legacy_data(session) == {}
+
+
+def test_renamed_transactions_keep_a_valid_fingerprint(session):
+    """The duplicate-import guard hashes the description, so it must be redone."""
+    from demo.demo_data import load_demo_data, translate_legacy_data
+    from database.models import Transaction
+    from services.transaction_service import fingerprint
+
+    load_demo_data(session, months_back=3, months_forward=1,
+                   today=date(2026, 8, 17))
+    session.commit()
+
+    row = session.execute(
+        select(Transaction).where(Transaction.description == "Groceries")
+    ).scalars().first()
+    assert row is not None
+    row.description = "Supermercado"
+    session.commit()
+
+    translate_legacy_data(session)
+    session.commit()
+    session.refresh(row)
+    assert row.description == "Groceries"
+    assert row.fingerprint == fingerprint(
+        row.txn_date, row.amount, row.description, row.account_id, row.kind)

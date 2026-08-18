@@ -59,9 +59,34 @@ def bootstrap() -> None:
                 report = load_demo_data(session)
                 st.session_state["_demo_report"] = report.summary()
             settings.onboarded = True
+        else:
+            _translate_legacy_names(session)
 
     st.session_state["_bootstrapped"] = True
     ui.invalidate_settings()
+
+
+def _translate_legacy_names(session) -> None:
+    """Rename the demo rows an older book was seeded with, once.
+
+    The demo dataset used to ship in Portuguese. Changing its definitions only
+    affects a fresh install, so a book created before that keeps the old names
+    until they are rewritten here. The check is cheap and the rename only
+    matches whole known phrases, so a book that has already been translated —
+    or never held the demo data at all — pays a single indexed lookup and
+    nothing is touched.
+    """
+    from demo.demo_data import needs_translation, translate_legacy_data
+
+    try:
+        if not needs_translation(session):
+            return
+        changed = translate_legacy_data(session)
+    except Exception:
+        # Never let a cosmetic rename stop the app from opening.
+        return
+    if changed:
+        st.session_state["_translation_report"] = sum(changed.values())
 
 
 def apply_theme(settings) -> None:
@@ -165,6 +190,16 @@ def main() -> None:
     ui.inject_css(ui.active_palette(settings))
 
     slug = sidebar()
+
+    renamed = st.session_state.pop("_translation_report", None)
+    if renamed:
+        st.info(
+            f"**Translated to English.** {renamed} demo record(s) that were still "
+            "named in Portuguese — accounts, recurring entries, goals, debts and "
+            "their transactions — now read in English. Nothing you typed yourself "
+            "was changed.",
+            icon="🌐",
+        )
 
     demo_note = st.session_state.pop("_demo_report", None)
     if demo_note:
