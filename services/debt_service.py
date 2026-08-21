@@ -13,21 +13,20 @@ from sqlalchemy.orm import Session
 from calculations.debt import (
     DebtInput,
     PayoffResult,
-    StrategyResult,
     compare_extra_payment,
     debt_alerts,
     debt_input_from_orm,
     interest_for_month,
     minimum_viable_payment,
     project_debt,
-    strategy_comparison,
 )
 from calculations.money import ZERO, D, money, money_sum
 from calculations.periods import Period, month_diff
-from constants import CategoryKind, DebtType, PayoffStrategy, TxnKind, TxnStatus
+from constants import CategoryKind, DebtType, TxnKind, TxnStatus
 from database.models import Account, Category, Debt, Transaction
 from schemas.validation import DebtIn
 from services.common import (
+    with_default_currency,
     ConflictError,
     NotFoundError,
     ServiceError,
@@ -36,7 +35,12 @@ from services.common import (
     send_to_recycle_bin,
     settings_snapshot,
 )
-from services.transaction_service import TxnFilter, create_transaction, list_transactions
+from services.transaction_service import (
+    TxnFilter,
+    create_transaction,
+    create_transfer,
+    list_transactions,
+)
 
 
 def list_debts(session: Session, *, active_only: bool = True) -> list[Debt]:
@@ -54,7 +58,7 @@ def get_debt(session: Session, debt_id: int) -> Debt:
 
 
 def create_debt(session: Session, payload: dict[str, Any]) -> Debt:
-    data = DebtIn(**payload)
+    data = DebtIn(**with_default_currency(session, payload))
     ensure_exists(session, Account, data.account_id, "Account")
     ensure_exists(session, Category, data.category_id, "Category")
     clash = session.execute(
@@ -130,22 +134,34 @@ def record_payment(
     principal_portion: Optional[Decimal] = None,
     description: Optional[str] = None,
     allow_duplicate: bool = False,
+    to_amount: Optional[Decimal] = None,
 ) -> dict[str, Any]:
     """Book a payment and move the balance.
 
     The balance moves by ``accrued interest − payment``. Supply
     ``principal_portion`` to use the exact figure from a statement instead of
     the app's estimate.
+
+    ``amount`` leaves the paying account and is denominated in *that* account's
+    currency. ``to_amount`` is what arrives, in the **debt's** currency, and is
+    required when the two differ — subtracting reais from a balance held in
+    euros would otherwise quietly corrupt the debt.
     """
     debt = get_debt(session, debt_id)
     amount = money(amount)
     if amount <= 0:
         raise ServiceError("A payment must be greater than zero.")
+    #: The magnitude in the debt's own currency — the only figure the balance
+    #: maths below may use.
+    settled = money(to_amount) if to_amount is not None else amount
+    if settled <= 0:
+        raise ServiceError("The amount reaching the debt must be greater than zero.")
     on_date = on_date or date.today()
 
     interest = ZERO if principal_portion is not None else accrued_interest_since(debt, on_date)
-    principal = money(principal_portion) if principal_portion is not None else money(amount - interest)
-    new_balance = money(debt.principal_balance + interest - amount)
+    principal = (money(principal_portion) if principal_portion is not None
+                 else money(settled - interest))
+    new_balance = money(debt.principal_balance + interest - settled)
     if new_balance < 0:
         new_balance = ZERO
 
@@ -155,13 +171,13 @@ def record_payment(
         raise ServiceError("Choose the account the payment comes from.")
 
     if debt.account_id and debt.account_id != account_id:
-        txn = create_transaction(session, {
+        txn = create_transfer(session, {
             "txn_date": on_date,
             "description": label,
             "amount": amount,
-            "kind": TxnKind.TRANSFER.value,
+            "to_amount": to_amount,
             "status": TxnStatus.COMPLETED.value,
-            "account_id": account_id,
+            "from_account_id": account_id,
             "to_account_id": debt.account_id,
             "debt_id": debt_id,
         }, allow_duplicate=allow_duplicate)
@@ -267,12 +283,14 @@ def inputs(session: Session, *, active_only: bool = True) -> list[DebtInput]:
     return result
 
 
-def unlinked_total(session: Session) -> Decimal:
+def unlinked_total(session: Session, *, currency: Optional[str] = None) -> Decimal:
     """Debt not represented by an account — added to net worth separately."""
+    code = currency.upper() if currency else None
     return money_sum(
         debt.principal_balance
         for debt in list_debts(session)
         if not debt.account_id
+        and (code is None or (debt.currency or "").upper() == code)
     )
 
 
@@ -297,10 +315,14 @@ class DebtView:
 
 
 def views(session: Session, *, period: Optional[Period] = None,
-          today: Optional[date] = None) -> list[DebtView]:
+          today: Optional[date] = None,
+          currency: Optional[str] = None) -> list[DebtView]:
     today = today or date.today()
+    code = currency.upper() if currency else None
     result: list[DebtView] = []
     for debt in list_debts(session):
+        if code is not None and (debt.currency or "").upper() != code:
+            continue
         balance = effective_balance(session, debt)
         item = debt_input_from_orm(debt)
         item.balance = balance
@@ -315,12 +337,15 @@ def views(session: Session, *, period: Optional[Period] = None,
     return result
 
 
-def totals(session: Session) -> dict[str, Decimal]:
+def totals(session: Session, *, currency: Optional[str] = None) -> dict[str, Decimal]:
     debts = list_debts(session)
+    if currency is not None:
+        code = currency.upper()
+        debts = [d for d in debts if (d.currency or "").upper() == code]
     current = balances(session)
     return {
         "balance": money_sum(current.get(d.id, d.principal_balance) for d in debts),
-        "unlinked_balance": unlinked_total(session),
+        "unlinked_balance": unlinked_total(session, currency=currency),
         "minimum_payments": money_sum(d.minimum_payment for d in debts),
         "planned_payments": money_sum(
             (d.planned_payment or d.minimum_payment) + (d.extra_payment or ZERO) for d in debts),
@@ -329,12 +354,6 @@ def totals(session: Session) -> dict[str, Decimal]:
             for d in debts),
         "count": Decimal(len(debts)),
     }
-
-
-def compare_strategies(session: Session, extra_pool: Decimal = ZERO,
-                       today: Optional[date] = None) -> dict[str, StrategyResult]:
-    return strategy_comparison(inputs(session), extra_pool=extra_pool,
-                               start_date=today or date.today())
 
 
 def extra_payment_scenario(session: Session, debt_id: int, extra: Decimal,

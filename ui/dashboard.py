@@ -10,8 +10,10 @@ import streamlit as st
 from calculations.money import ZERO, D, money, money_sum
 from charts import dashboard_charts as dc
 from charts import financial_charts as fc
+from constants import ALLOCATION_KINDS
 from services import (
     account_service,
+    category_service,
     forecast_service,
     goal_service,
     reporting_service,
@@ -20,9 +22,7 @@ from ui import components as ui
 
 
 def render() -> None:
-    fmt = ui.formatter()
     settings = ui.current_settings()
-    theme = ui.theme()
     today = date.today()
 
     ui.page_header(
@@ -31,17 +31,44 @@ def render() -> None:
         icon="📊",
     )
 
-    period = ui.period_picker(key="dash_period")
+    ui.fx_rate_slot()
+
+    picker, period_col = st.columns([0.32, 0.68])
+    with picker:
+        currency = ui.currency_picker(key="dash_currency")
+    with period_col:
+        period = ui.period_picker(key="dash_period")
+
+    # A converted view is meaningless without a rate; say so rather than
+    # rendering a page of numbers that quietly assume parity.
+    book = ui.currency_book()
+    if currency is None:
+        missing = [c for c in book.active if not book.has_rate(c)]
+        if missing:
+            st.error(
+                f"No exchange rate on file for {', '.join(missing)}. Enter one "
+                "above, or pick a single currency to see it unconverted.",
+                icon="💱",
+            )
+            return
+        ui.converted_notice(book)
+
+    # In combined mode the figures are converted into the primary, so the page
+    # is single-currency again from here on and formats as the primary.
+    display = currency or book.primary
+    fmt = ui.formatter(display)
+    theme = ui.theme(display)
 
     with ui.db_read() as session:
-        snapshot = reporting_service.dashboard(session, period, today)
-        history = reporting_service.trailing_history(session, 12, today)
+        snapshot = _snapshot_for(session, period, today, currency, book)
+        history = _history_for(session, today, currency, book)
         categories = reporting_service.category_totals(
             session, period, kinds=["expense", "savings", "investment", "debt"],
+            currency=currency,
         )
         bundle = forecast_service.build(session, months=9, history_months=6, today=today)
         account_views = account_service.balance_views(session, as_of=today, period=period)
-        averages = reporting_service.averages(session, 6, today)
+        averages = reporting_service.averages(session, 6, today, currency)
 
     if not snapshot.has_data:
         _first_run(period)
@@ -53,7 +80,7 @@ def render() -> None:
 
     tabs = st.tabs([
         "Overview", "Budget performance", "Cash flow", "Where it goes",
-        "Goals", "Accounts",
+        "Category trends", "Goals", "Accounts",
     ])
 
     with tabs[0]:
@@ -61,16 +88,53 @@ def render() -> None:
     with tabs[1]:
         _budget_performance(snapshot, theme, fmt)
     with tabs[2]:
-        _cash_flow(snapshot, history, theme, fmt, settings)
+        _cash_flow(snapshot, history, theme, fmt, settings, currency)
     with tabs[3]:
         _where_it_goes(categories, snapshot, theme, fmt)
     with tabs[4]:
-        _goals(snapshot, theme, fmt)
+        _category_trends(theme, fmt, today)
     with tabs[5]:
+        _goals(snapshot, theme, fmt)
+    with tabs[6]:
         _accounts(account_views, theme, fmt)
 
 
 # --------------------------------------------------------------------------
+def _snapshot_for(session, period, today, currency, book):
+    """Filtered snapshot, or every currency converted into the primary."""
+    if currency is not None:
+        return reporting_service.dashboard(session, period, today, currency=currency)
+    return reporting_service.dashboard_combined(session, period, today, book=book)
+
+
+def _history_for(session, today, currency, book, months: int = 12):
+    """Trailing history, converted and added row-wise in combined mode."""
+    if currency is not None:
+        return reporting_service.trailing_history(session, months, today, currency)
+
+    per_currency = {
+        code: reporting_service.trailing_history(session, months, today, code)
+        for code in book.active
+    }
+    base = per_currency[book.primary]
+    money_keys = ("income", "expenses", "savings", "investments", "debt_payments",
+                  "total_outflow", "net", "cash_flow", "opening_cash", "closing_cash")
+    merged = []
+    for index, row in enumerate(base):
+        combined = dict(row)
+        for key in money_keys:
+            if key not in combined:
+                continue
+            combined[key] = money_sum(
+                book.convert(rows[index][key], code, book.primary)
+                for code, rows in per_currency.items() if index < len(rows)
+            )
+        # A rate recomputed from converted totals, not averaged across them.
+        combined["savings_rate"] = ui.savings_rate_of(combined)
+        merged.append(combined)
+    return merged
+
+
 def _first_run(period) -> None:
     ui.empty_state(
         "Your dashboard is waiting for its first numbers",
@@ -321,8 +385,19 @@ def _budget_performance(snapshot, theme, fmt: ui.Formatter) -> None:
 
 
 # --------------------------------------------------------------------------
-def _cash_flow(snapshot, history, theme, fmt: ui.Formatter, settings) -> None:
+def _cash_flow(snapshot, history, theme, fmt: ui.Formatter, settings,
+               currency=None) -> None:
     flow = snapshot.flow
+    book = ui.currency_book()
+    if currency is not None and book.is_multi:
+        # Under a filter the cash pool holds one currency, so money sent to
+        # another shows as an outflow with nothing coming back. That is the
+        # truth for this pool, but it reads like a bug without saying so.
+        st.caption(
+            f"Showing {book.symbol(currency)} {currency} only. Money moved to an "
+            f"account in another currency appears here as an outflow — the matching "
+            f"inflow belongs to that currency's own cash flow."
+        )
     left, right = st.columns([0.48, 0.52])
 
     with left:
@@ -417,6 +492,78 @@ def _where_it_goes(categories, snapshot, theme, fmt: ui.Formatter) -> None:
          ("amount", "Spent", "money"), ("share", "Share", "pct")],
         fmt, height=340,
     )
+
+
+# --------------------------------------------------------------------------
+def _download(rows, name: str) -> None:
+    from import_export.csv_handler import rows_to_csv
+
+    if not rows:
+        return
+    st.download_button(f"⬇ Download {name} as CSV", rows_to_csv(rows),
+                       file_name=f"{name}-{date.today().isoformat()}.csv",
+                       mime="text/csv", key=f"dl_{name}")
+
+
+# --------------------------------------------------------------------------
+def _category_trends(theme, fmt: ui.Formatter, today: date) -> None:
+    with ui.db_read() as session:
+        parents = category_service.list_categories(
+            session, kinds=list(ALLOCATION_KINDS), parents_only=True)
+    if not parents:
+        st.caption("No categories to chart.")
+        return
+
+    columns = st.columns([0.3, 0.7])
+    with columns[0]:
+        months = st.select_slider("Months", [6, 12, 18, 24, 36], value=12,
+                                  key="dash_trend_months")
+    with columns[1]:
+        options = [(cat.id, cat.name) for cat in parents]
+        default = [cat.id for cat in parents[:5]]
+        chosen = st.multiselect("Categories", [item[0] for item in options],
+                                default=default,
+                                format_func=lambda item: dict(options)[item],
+                                key="dash_trend_cats")
+    if not chosen:
+        st.caption("Pick at least one category.")
+        return
+
+    with ui.db_read() as session:
+        periods = reporting_service.trailing_periods(session, months, today)
+        rows = reporting_service.category_trend(session, chosen, periods)
+
+    view = st.radio("View", ["Lines", "Stacked bars", "Heatmap"], horizontal=True,
+                    key="dash_trend_view")
+    if view == "Lines":
+        ui.chart(fc.category_trend_lines(rows, theme, height=380),
+                 key="dash_trend_lines")
+    elif view == "Stacked bars":
+        ui.chart(fc.stacked_category_bars(rows, theme, height=380),
+                 key="dash_trend_bars")
+    else:
+        ui.chart(fc.spending_heatmap(rows, theme, height=420), key="dash_trend_heat")
+
+    totals: dict[str, list] = {}
+    for row in rows:
+        totals.setdefault(row["category"], []).append(D(row["amount"]))
+    summary = [
+        {"category": name,
+         "total": money_sum(values),
+         "average": money(money_sum(values) / max(1, len(values))),
+         "highest": max(values) if values else ZERO,
+         "lowest": min(values) if values else ZERO}
+        for name, values in totals.items()
+    ]
+    summary.sort(key=lambda item: item["total"], reverse=True)
+    ui.money_table(
+        summary,
+        [("category", "Category", "text"), ("total", "Total", "money"),
+         ("average", "Monthly average", "money"), ("highest", "Highest month", "money"),
+         ("lowest", "Lowest month", "money")],
+        fmt,
+    )
+    _download(rows, "category-trends")
 
 
 # --------------------------------------------------------------------------

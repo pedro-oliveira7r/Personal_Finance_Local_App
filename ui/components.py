@@ -142,8 +142,41 @@ def current_settings() -> SettingsSnapshot:
     return snapshot
 
 
+def currency_book():
+    """The book's currencies and latest rates, fetched once per rerun.
+
+    Cached like the settings snapshot. Rates are global and unversioned, so a
+    stale cache would show yesterday's number immediately after a save.
+    """
+    from services.currency_service import book as _book
+
+    cached = st.session_state.get("_currency_book")
+    if cached is not None and st.session_state.get("_currency_rerun") == st.session_state.get(
+            "_rerun_token"):
+        return cached
+    with db_read() as session:
+        resolved = _book(session)
+    st.session_state["_currency_book"] = resolved
+    st.session_state["_currency_rerun"] = st.session_state.get("_rerun_token")
+    return resolved
+
+
 def invalidate_settings() -> None:
     st.session_state.pop("_settings_snapshot", None)
+    st.session_state.pop("_currency_book", None)
+
+
+def savings_rate_of(row: dict) -> Decimal:
+    """Savings rate for a history row, recomputed from its own totals.
+
+    Combining currencies means the component figures change; averaging the
+    per-currency percentages instead would weight a small balance equally with
+    a large one.
+    """
+    from calculations.budgeting import savings_rate
+
+    saved = money(D(row.get("savings", ZERO)) + D(row.get("investments", ZERO)))
+    return savings_rate(D(row.get("income", ZERO)), saved)
 
 
 def md(text: Any) -> str:
@@ -165,12 +198,27 @@ def md(text: Any) -> str:
 @dataclass
 class Formatter:
     settings: SettingsSnapshot
+    #: Page-level default. Set once at the top of a filtered page so every
+    #: ``fmt.money(x)`` below is right without threading a keyword through
+    #: forty call sites.
+    currency: Optional[str] = None
 
-    def money(self, value: Any, *, compact: bool = False, signed: bool = False,
+    def money(self, value: Any, *, currency: Optional[str] = None,
+              compact: bool = False, signed: bool = False,
               show_symbol: bool = True) -> str:
         places = 2 if self.settings.show_cents else 0
-        return format_money(value, self.settings.base_currency, places=places,
+        code = currency or self.currency or self.settings.base_currency
+        return format_money(value, code, places=places,
                             compact=compact, signed=signed, show_symbol=show_symbol)
+
+    def for_currency(self, code: Optional[str]) -> "Formatter":
+        """A sibling formatter pinned to another currency."""
+        return Formatter(self.settings, code)
+
+    def symbol(self, code: Optional[str] = None) -> str:
+        from services.currency_service import symbol_for
+
+        return symbol_for(code or self.currency or self.settings.base_currency)
 
     def md_money(self, value: Any, **kwargs: Any) -> str:
         """``money`` for a markdown context — see :func:`md`."""
@@ -188,8 +236,8 @@ class Formatter:
         return self.money(value, signed=True)
 
 
-def formatter() -> Formatter:
-    return Formatter(current_settings())
+def formatter(currency: Optional[str] = None) -> Formatter:
+    return Formatter(current_settings(), currency)
 
 
 def active_mode(settings: Optional[SettingsSnapshot] = None) -> str:
@@ -215,10 +263,16 @@ def active_palette(settings: Optional[SettingsSnapshot] = None) -> Palette:
     return palette_for(active_mode(settings))
 
 
-def theme() -> ChartTheme:
-    """Chart theme for the active palette, so figures sit on the right plane."""
+def theme(currency: Optional[str] = None) -> ChartTheme:
+    """Chart theme for the active palette, so figures sit on the right plane.
+
+    ``currency`` sets the axis prefix and separators for the whole figure. That
+    one slot is enough because every chart in the app is single-currency: a
+    filtered page draws one currency, and the combined view draws values
+    already converted into the primary.
+    """
     settings = current_settings()
-    return get_theme(active_palette(settings), settings.base_currency)
+    return get_theme(active_palette(settings), currency or settings.base_currency)
 
 
 def _dark_mode(settings: Optional[SettingsSnapshot] = None) -> bool:
@@ -319,28 +373,111 @@ def pill(text: str, severity: str = Severity.INFO.value, icon: str = "") -> str:
     return f"<span class='pf-pill {css}'>{glyph} {text}</span>"
 
 
+DISMISSED_ALERTS_KEY = "dismissed_alerts"
+
+
+def _alert_fingerprint(alert) -> str:
+    """Stable id for one alert, from what the user actually reads.
+
+    The ``code`` alone is not unique — "category_over" fires once per category —
+    so the message is folded in too. Hashing keeps the stored preference small
+    and free of the user's own category names.
+    """
+    import hashlib
+
+    raw = f"{getattr(alert, 'code', '')}|{getattr(alert, 'message', '')}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def _read_dismissed_alerts() -> set[str]:
+    from services import settings_service
+
+    try:
+        with db_read() as session:
+            prefs = settings_service.get_dashboard_prefs(session)
+    except Exception:
+        return set()
+    return set(prefs.get(DISMISSED_ALERTS_KEY) or [])
+
+
+def _write_dismissed_alerts(fingerprints: Iterable[str]) -> None:
+    from services import settings_service
+
+    payload = sorted(set(fingerprints))
+    with db_write() as session:
+        settings_service.set_dashboard_prefs(session, {DISMISSED_ALERTS_KEY: payload})
+    invalidate_settings()
+    for key in [k for k in st.session_state if k.startswith("alert_")]:
+        if key[len("alert_"):] not in payload:
+            del st.session_state[key]
+
+
 def alert_panel(alerts: Sequence, *, limit: int = 8, title: str = "Needs your attention",
-                empty_message: str = "Nothing needs attention right now.") -> None:
-    if not alerts:
-        st.success(f"✅ {empty_message}")
+                empty_message: str = "Nothing needs attention right now.",
+                dismissible: bool = True) -> None:
+    """Alerts the user can tick off.
+
+    Ticking one stores its fingerprint, so it stays gone across reruns and
+    restarts. Fingerprints for alerts that are no longer raised are pruned on
+    every pass: once the underlying problem is actually fixed the record of
+    having dismissed it is dropped, so if the same problem returns later it is
+    raised again rather than staying silently hidden.
+    """
+    if not dismissible:
+        visible, dismissed_count = list(alerts), 0
+    else:
+        live = {_alert_fingerprint(alert): alert for alert in alerts}
+        stored = _read_dismissed_alerts()
+        pruned = stored & set(live)
+        if pruned != stored:  # some dismissed alerts no longer apply
+            _write_dismissed_alerts(pruned)
+        visible = [alert for key, alert in live.items() if key not in pruned]
+        dismissed_count = len(pruned)
+
+    if not visible:
+        note = (f" {dismissed_count} dismissed." if dismissed_count else "")
+        st.success(f"✅ {empty_message}{note}")
+        if dismissed_count and st.button("Bring dismissed ones back", key="alerts_restore"):
+            _write_dismissed_alerts([])
+            st.rerun()
         return
+
     counts = {"critical": 0, "warning": 0, "info": 0, "success": 0}
-    for alert in alerts:
-        counts[getattr(alert, "severity", "info")] = counts.get(
-            getattr(alert, "severity", "info"), 0) + 1
+    for alert in visible:
+        severity = getattr(alert, "severity", "info")
+        counts[severity] = counts.get(severity, 0) + 1
     header = f"{title} — {counts['critical']} urgent · {counts['warning']} warnings"
     with st.expander(header, expanded=counts["critical"] > 0):
-        for alert in alerts[:limit]:
+        if dismissible:
+            st.caption("Tick a warning to clear it. It comes back if the problem does.")
+        for alert in visible[:limit]:
             severity = getattr(alert, "severity", "info")
             icon = SEVERITY_ICONS.get(severity, "•")
             detail = getattr(alert, "detail", None)
-            st.markdown(
-                f"{icon} **{alert.message}**" + (f"  \n<span class='pf-muted'>{detail}</span>"
-                                                 if detail else ""),
-                unsafe_allow_html=True,
-            )
-        if len(alerts) > limit:
-            st.caption(f"…and {len(alerts) - limit} more.")
+            body = (f"{icon} **{alert.message}**"
+                    + (f"  \n<span class='pf-muted'>{detail}</span>" if detail else ""))
+            if not dismissible:
+                st.markdown(body, unsafe_allow_html=True)
+                continue
+            tick, text = st.columns([0.04, 0.96])
+            with tick:
+                checked = st.checkbox(
+                    "Dismiss this warning", key=f"alert_{_alert_fingerprint(alert)}",
+                    value=False, label_visibility="collapsed",
+                )
+            with text:
+                st.markdown(body, unsafe_allow_html=True)
+            if checked:
+                _write_dismissed_alerts(
+                    _read_dismissed_alerts() | {_alert_fingerprint(alert)})
+                st.rerun()
+        if len(visible) > limit:
+            st.caption(f"…and {len(visible) - limit} more.")
+        if dismissible and dismissed_count:
+            st.caption(f"{dismissed_count} dismissed.")
+            if st.button("Bring dismissed ones back", key="alerts_restore"):
+                _write_dismissed_alerts([])
+                st.rerun()
 
 
 # --------------------------------------------------------------------------
@@ -420,12 +557,13 @@ def confirm_action(
 def money_input(label: str, value: Any = ZERO, *, key: Optional[str] = None,
                 help_text: str = "", min_value: float = 0.0,
                 max_value: float = 999_999_999.99, step: float = 50.0,
-                disabled: bool = False) -> Decimal:
+                disabled: bool = False, currency: Optional[str] = None) -> Decimal:
     settings = current_settings()
     symbol = ""
     from constants import CURRENCY_FORMATS
 
-    fmt = CURRENCY_FORMATS.get(settings.base_currency.upper())
+    code = (currency or settings.base_currency).upper()
+    fmt = CURRENCY_FORMATS.get(code)
     if fmt:
         symbol = fmt["symbol"]
     raw = st.number_input(
@@ -466,6 +604,152 @@ def select_with_none(label: str, options: Sequence[tuple[int, str]], *,
 # --------------------------------------------------------------------------
 # Period picker
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Currency selection
+# --------------------------------------------------------------------------
+CURRENCY_KEY = "_selected_currency"
+
+#: What the picker stores when the user asks for everything at once.
+ALL_CURRENCIES = "__all__"
+
+
+def selected_currency(book=None) -> Optional[str]:
+    """The active filter: a currency code, or ``None`` meaning "All".
+
+    Persists across pages like the period does — filter to euros on the
+    Dashboard and the Transactions list follows you there.
+    """
+    book = book or currency_book()
+    if not book.is_multi:
+        return book.primary
+    stored = st.session_state.get(CURRENCY_KEY)
+    if stored == ALL_CURRENCIES:
+        return None
+    if stored in book.active:
+        return stored
+    return book.primary
+
+
+def set_selected_currency(code: Optional[str]) -> None:
+    st.session_state[CURRENCY_KEY] = code or ALL_CURRENCIES
+
+
+def currency_picker(*, key: str = "currency_picker", label: str = "Currency",
+                    include_all: bool = True,
+                    default: Optional[str] = None, book=None) -> Optional[str]:
+    """Pick one currency, or "All" for a converted view.
+
+    Renders **nothing** on a single-currency book and simply returns the
+    primary — that is what keeps a book that never leaves reais looking exactly
+    as it did before any of this existed.
+
+    Returns ``None`` for "All", which every aggregator reads as "do not filter".
+    """
+    book = book or currency_book()
+    if not book.is_multi:
+        return book.primary
+
+    options: list[str] = list(book.active)
+    if include_all:
+        options.append(ALL_CURRENCIES)
+
+    if CURRENCY_KEY not in st.session_state and default is not None:
+        set_selected_currency(default)
+    active = st.session_state.get(CURRENCY_KEY)
+    if active not in options:
+        active = book.primary
+
+    def render(code: str) -> str:
+        if code == ALL_CURRENCIES:
+            return f"All · {book.primary}"
+        return f"{book.symbol(code)} {code}"
+
+    chosen = st.radio(label, options, index=options.index(active),
+                      format_func=render, horizontal=True, key=f"{key}_radio")
+    set_selected_currency(None if chosen == ALL_CURRENCIES else chosen)
+    return None if chosen == ALL_CURRENCIES else chosen
+
+
+def converted_notice(book=None, *, today: Optional[date] = None) -> None:
+    """Say plainly that a combined figure was converted, and at what."""
+    book = book or currency_book()
+    others = [c for c in book.active if c != book.primary]
+    if not others:
+        return
+    parts = []
+    for code in others:
+        if not book.has_rate(code):
+            continue
+        # md() because two currency symbols in one markdown block render as LaTeX.
+        parts.append(md(f"1 {book.symbol(code)} = "
+                        f"{format_money(book.rate_to_primary(code), book.primary)}"))
+    detail = " · ".join(parts)
+    st.caption(
+        f"Combined view — every currency converted to {md(book.symbol())} "
+        f"{book.primary} at today's rate. {detail}\n\n"
+        "Past periods use today's rate too, so they move when you update it."
+    )
+
+
+def fx_rate_slot(*, key: str = "fx_rates", today: Optional[date] = None) -> None:
+    """Today's rate for each non-primary currency.
+
+    Hidden entirely on a single-currency book.
+    """
+    book = currency_book()
+    others = [c for c in book.active if c != book.primary]
+    if not others:
+        return
+    today = today or date.today()
+
+    with st.expander(f"💱 Exchange rates · {book.primary}", expanded=not all(
+            book.has_rate(c) for c in others)):
+        entered: dict[str, Decimal] = {}
+        columns = st.columns(len(others) + 1)
+        for index, code in enumerate(others):
+            with columns[index]:
+                current = book.rates.get(code)
+                entered[code] = D(st.number_input(
+                    f"1 {book.symbol(code)} {code} = ? {book.primary}",
+                    min_value=0.0, max_value=1_000_000.0,
+                    value=to_float(current) if current is not None else 0.0,
+                    step=0.01, format="%.6f", key=f"{key}_{code}",
+                ))
+                stale = book.stale_days(code, today)
+                if current is None:
+                    st.caption("⚠️ no rate on file yet")
+                elif stale:
+                    st.caption(f"set {stale} day(s) ago")
+                else:
+                    st.caption("set today")
+        with columns[-1]:
+            st.write("")
+            if st.button("Save today's rates", key=f"{key}_save", **wide()):
+                def action(session):
+                    from services import currency_service
+
+                    saved = 0
+                    for code, value in entered.items():
+                        if value > 0 and value != book.rates.get(code):
+                            currency_service.set_rate(session, code, value, as_of=today)
+                            saved += 1
+                    return saved
+
+                saved = run_action(action, rerun=False)
+                if saved is not None:
+                    invalidate_settings()
+                    flash(f"{saved} rate(s) recorded." if saved
+                          else "Nothing changed.", "success" if saved else "info")
+                    st.rerun()
+
+        for code in others:
+            stale = book.stale_days(code, today)
+            if stale is not None and stale >= 7:
+                st.warning(
+                    f"The {code} rate was last set {stale} days ago. Converted "
+                    "totals are only as current as this number.", icon="⏳")
+
+
 PERIOD_KEY = "_selected_period"
 
 
@@ -580,9 +864,16 @@ def variance_table(rows: Sequence, fmt: Formatter, *, height: Optional[int] = No
 
 def money_table(rows: Sequence[dict], columns: Sequence[tuple[str, str, str]],
                 fmt: Formatter, *, height: Optional[int] = None,
-                key: Optional[str] = None) -> None:
+                key: Optional[str] = None, currency: Optional[str] = None,
+                currency_key: Optional[str] = None) -> None:
     """``columns`` are ``(source_key, header, kind)`` with kind in
-    ``text|money|pct|date|int``."""
+    ``text|money|pct|date|int``.
+
+    ``currency`` pins the whole table; ``currency_key`` names a key on each row
+    holding that row's own code, for the genuinely mixed tables (accounts,
+    transactions). Cells stay strings either way, so the column dtype the
+    dataframe needs is unaffected.
+    """
     if not rows:
         st.caption("Nothing to show.")
         return
@@ -594,7 +885,9 @@ def money_table(rows: Sequence[dict], columns: Sequence[tuple[str, str, str]],
             if kind == "money":
                 # Missing is not the same as zero — say so, and keep the whole
                 # column textual so its dtype stays consistent.
-                record[header] = fmt.money(value) if value is not None else "—"
+                code = (row.get(currency_key) if currency_key else None) or currency
+                record[header] = (fmt.money(value, currency=code)
+                                  if value is not None else "—")
             elif kind == "pct":
                 record[header] = fmt.pct(value) if value is not None else "—"
             elif kind == "date":

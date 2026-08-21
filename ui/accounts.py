@@ -40,28 +40,8 @@ def render() -> None:
 
 
 # ==========================================================================
-def _balances() -> None:
-    fmt = ui.formatter()
-    theme = ui.theme()
-    settings = ui.current_settings()
-    today = date.today()
-    period = settings.current_period(today)
-
-    with ui.db_read() as session:
-        views = account_service.balance_views(session, as_of=today, period=period)
-        totals = account_service.totals(views)
-        archived = account_service.balance_views(session, as_of=today,
-                                                include_archived=True)
-
-    if not views:
-        ui.empty_state(
-            "No accounts yet",
-            "Add the accounts you actually use — a checking account, a wallet, a credit "
-            "card. Balances, net worth and cash-flow projections all build from them.",
-            icon="🏦",
-        )
-        return
-
+def _totals_row(totals, fmt: ui.Formatter) -> None:
+    """The five headline balances, in one currency."""
     ui.kpi_row([
         ui.Kpi("Cash available", fmt.money(totals.cash), icon="💵",
                help_text="Checking, savings and cash accounts."),
@@ -74,6 +54,45 @@ def _balances() -> None:
                delta_good=None),
     ])
 
+
+def _balances() -> None:
+    settings = ui.current_settings()
+    today = date.today()
+    period = settings.current_period(today)
+
+    # "All" here needs no conversion at all: the KPI row simply repeats per
+    # currency and every table row prints in its own account's currency.
+    currency = ui.currency_picker(key="acct_currency")
+    fmt = ui.formatter(currency)
+    theme = ui.theme(currency)
+
+    with ui.db_read() as session:
+        views = account_service.balance_views(session, as_of=today, period=period)
+        archived = account_service.balance_views(session, as_of=today,
+                                                include_archived=True)
+    if currency is not None:
+        views = [v for v in views if (v.account.currency or "").upper() == currency]
+    totals = account_service.totals(views, currency)
+
+    if not views:
+        ui.empty_state(
+            "No accounts yet",
+            "Add the accounts you actually use — a checking account, a wallet, a credit "
+            "card. Balances, net worth and cash-flow projections all build from them.",
+            icon="🏦",
+        )
+        return
+
+    book = ui.currency_book()
+    if currency is None and book.is_multi:
+        # One row per currency rather than one meaningless combined row.
+        for code, part in account_service.totals_by_currency(views).items():
+            st.caption(f"{book.symbol(code)} {code}")
+            _totals_row(part, fmt.for_currency(code))
+        ui.divider()
+    else:
+        _totals_row(totals, fmt)
+
     ui.divider()
     left, right = st.columns([0.55, 0.45])
     with left:
@@ -83,6 +102,7 @@ def _balances() -> None:
         ui.section("Details")
         ui.money_table(
             [{"name": f"{view.account.icon or ''} {view.name}".strip(),
+              "currency": view.account.currency,
               "type": view.type_label,
               "balance": view.display_balance,
               "note": "owed" if view.is_liability else "",
@@ -95,6 +115,9 @@ def _balances() -> None:
              ("movement", f"Change in {period.short_label}", "money"),
              ("util", "Used", "pct"), ("available", "Credit left", "money")],
             fmt, height=340,
+            # Each row prints in its own account's currency, so the table stays
+            # readable with no conversion and no misleading total row.
+            currency_key="currency",
         )
 
     negatives = [view for view in views if view.balance < 0 and not view.is_liability]
@@ -245,6 +268,26 @@ def _net_worth() -> None:
 
 
 # ==========================================================================
+def _currency_select(label: str, options: list[str], current: str, *,
+                     key: str, disabled: bool = False,
+                     help_text: str = "") -> str:
+    """Currency picker that disappears in a single-currency book.
+
+    Showing a one-option dropdown would just be noise on a book that never
+    leaves reais, so the field only appears once a second currency is active.
+    """
+    from services.currency_service import symbol_for
+
+    if len(options) < 2 and not disabled:
+        return current or (options[0] if options else "BRL")
+    index = options.index(current) if current in options else 0
+    return st.selectbox(
+        label, options, index=index, key=key, disabled=disabled,
+        format_func=lambda code: f"{symbol_for(code)} {code}",
+        help=help_text or None,
+    )
+
+
 def _manage() -> None:
     fmt = ui.formatter()
     with ui.db_read() as session:
@@ -277,7 +320,9 @@ def _manage() -> None:
 def _new_account_form() -> None:
     with st.expander("➕ Add an account", expanded=False):
         with st.form("new_account", clear_on_submit=True):
-            columns = st.columns([0.34, 0.33, 0.33])
+            settings = ui.current_settings()
+            active = list(settings.active_currencies)
+            columns = st.columns([0.28, 0.26, 0.20, 0.26])
             with columns[0]:
                 name = st.text_input("Name", placeholder="e.g. Checking — Nubank")
             with columns[1]:
@@ -285,6 +330,9 @@ def _new_account_form() -> None:
                     "Type", list(ACCOUNT_TYPE_LABELS),
                     format_func=lambda item: ACCOUNT_TYPE_LABELS[item])
             with columns[2]:
+                currency = _currency_select("Currency", active, active[0],
+                                            key="new_acct_currency")
+            with columns[3]:
                 institution = st.text_input("Institution (optional)")
 
             columns = st.columns([0.25, 0.25, 0.25, 0.25])
@@ -324,7 +372,7 @@ def _new_account_form() -> None:
                     st.error("Give the account a name.")
                 else:
                     payload = {
-                        "name": name, "type": acct_type,
+                        "name": name, "type": acct_type, "currency": currency,
                         "institution": institution or None,
                         "opening_balance": opening, "opening_date": opening_date,
                         "credit_limit": limit if limit > 0 else None,
@@ -352,6 +400,22 @@ def _edit_account_form(account, fmt: ui.Formatter) -> None:
     with columns[2]:
         institution = st.text_input("Institution", value=account.institution or "",
                                     key="ea_inst")
+
+    settings = ui.current_settings()
+    active = list(settings.active_currencies)
+    with ui.db_read() as session:
+        txn_count = account_service.usage_count(session, account.id)["transactions"]
+    locked = txn_count > 0
+    currency = _currency_select(
+        "Currency", active, account.currency, key="ea_currency", disabled=locked,
+        help_text=("Locked: this account already holds transactions. Changing its "
+                   "currency would re-label every one of them without converting "
+                   "anything." if locked else
+                   "Only changeable while the account is still empty."),
+    )
+    if locked and len(active) > 1:
+        st.caption(f"Currency is fixed at **{account.currency}** — "
+                   f"{txn_count} transaction(s) are already denominated in it.")
 
     columns = st.columns(4)
     with columns[0]:
@@ -388,6 +452,7 @@ def _edit_account_form(account, fmt: ui.Formatter) -> None:
                      **ui.wide()):
             payload = {
                 "name": name, "type": acct_type, "institution": institution or None,
+                "currency": account.currency if locked else currency,
                 "opening_balance": opening, "opening_date": opening_date,
                 "credit_limit": limit if limit > 0 else None,
                 "interest_rate": rate if rate > 0 else None,

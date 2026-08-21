@@ -9,7 +9,7 @@ from typing import Optional, Sequence
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from calculations.cashflow import account_balance
+from calculations.cashflow import account_balance, accounts_in
 from calculations.money import ZERO, money, money_sum
 from calculations.net_worth import (
     NetWorthLine,
@@ -31,11 +31,13 @@ from services.common import (
 )
 
 
-def current_summary(session: Session, *, as_of: Optional[date] = None) -> NetWorthSummary:
+def current_summary(session: Session, *, as_of: Optional[date] = None,
+                    currency: Optional[str] = None) -> NetWorthSummary:
     """Net worth right now (or on ``as_of``), from account balances."""
     as_of = as_of or date.today()
+    code = currency.upper() if currency else None
     accounts = {a.id: a for a in load_accounts(session, include_archived=True)}
-    infos = load_account_infos(session)
+    infos = accounts_in(load_account_infos(session), currency)
     txns = load_cash_txns(session)
     lines: list[NetWorthLine] = []
     for info in infos:
@@ -49,11 +51,12 @@ def current_summary(session: Session, *, as_of: Optional[date] = None) -> NetWor
             balance=account_balance(info, txns, as_of=as_of),
             include=account.include_in_net_worth,
         ))
-    lines.extend(_unlinked_debt_lines(session))
+    lines.extend(_unlinked_debt_lines(session, currency=code))
     return summarise_net_worth(lines, as_of=as_of)
 
 
-def _unlinked_debt_lines(session: Session) -> list[NetWorthLine]:
+def _unlinked_debt_lines(session: Session, *,
+                         currency: Optional[str] = None) -> list[NetWorthLine]:
     """Debts with no account of their own still count against net worth."""
     from constants import AccountType
     from database.models import Debt
@@ -68,7 +71,9 @@ def _unlinked_debt_lines(session: Session) -> list[NetWorthLine]:
             type=AccountType.OTHER_LIABILITY.value,
             balance=money(-debt.principal_balance),
         )
-        for debt in rows if debt.principal_balance
+        for debt in rows
+        if debt.principal_balance
+        and (currency is None or (debt.currency or "").upper() == currency)
     ]
 
 
@@ -121,11 +126,23 @@ def change(session: Session, months: int = 12,
 # Snapshots
 # --------------------------------------------------------------------------
 def save_snapshot(session: Session, *, as_of: Optional[date] = None,
-                  manual: bool = False) -> NetWorthSnapshot:
+                  manual: bool = False,
+                  currency: Optional[str] = None) -> NetWorthSnapshot:
+    """Freeze net worth for one currency on one date.
+
+    Stored per currency and never converted. A single combined figure would be
+    frozen at whatever rate happened to be latest that day, while the live
+    number kept re-valuing — so the history chart would step every time a rate
+    was edited, comparing frozen-converted past against live-converted present.
+    """
+    from services.currency_service import active_currencies
+
     as_of = as_of or date.today()
-    summary = current_summary(session, as_of=as_of)
+    code = (currency or active_currencies(session)[0]).upper()
+    summary = current_summary(session, as_of=as_of, currency=code)
     existing = session.execute(
-        select(NetWorthSnapshot).where(NetWorthSnapshot.as_of_date == as_of)
+        select(NetWorthSnapshot).where(NetWorthSnapshot.as_of_date == as_of,
+                                       NetWorthSnapshot.currency == code)
     ).scalars().first()
     detail = {
         "assets": [[line.name, str(line.magnitude)] for line in summary.assets],
@@ -141,6 +158,7 @@ def save_snapshot(session: Session, *, as_of: Optional[date] = None,
         return existing
     snapshot = NetWorthSnapshot(
         as_of_date=as_of,
+        currency=code,
         total_assets=summary.total_assets,
         total_liabilities=summary.total_liabilities,
         net_worth=summary.net_worth,
@@ -152,10 +170,21 @@ def save_snapshot(session: Session, *, as_of: Optional[date] = None,
     return snapshot
 
 
-def list_snapshots(session: Session, limit: int = 120) -> list[NetWorthSnapshot]:
-    return list(session.execute(
-        select(NetWorthSnapshot).order_by(NetWorthSnapshot.as_of_date.desc()).limit(limit)
-    ).scalars())
+def save_all_snapshots(session: Session, *, as_of: Optional[date] = None,
+                       manual: bool = False) -> list[NetWorthSnapshot]:
+    """One snapshot per active currency."""
+    from services.currency_service import active_currencies
+
+    return [save_snapshot(session, as_of=as_of, manual=manual, currency=code)
+            for code in active_currencies(session)]
+
+
+def list_snapshots(session: Session, limit: int = 120,
+                   currency: Optional[str] = None) -> list[NetWorthSnapshot]:
+    stmt = select(NetWorthSnapshot).order_by(NetWorthSnapshot.as_of_date.desc())
+    if currency is not None:
+        stmt = stmt.where(NetWorthSnapshot.currency == currency.upper())
+    return list(session.execute(stmt.limit(limit)).scalars())
 
 
 def delete_snapshot(session: Session, snapshot_id: int) -> None:
@@ -166,7 +195,8 @@ def delete_snapshot(session: Session, snapshot_id: int) -> None:
     session.flush()
 
 
-def snapshot_points(session: Session) -> list[NetWorthPoint]:
+def snapshot_points(session: Session,
+                    currency: Optional[str] = None) -> list[NetWorthPoint]:
     return [
         NetWorthPoint(
             as_of=row.as_of_date,
@@ -175,7 +205,8 @@ def snapshot_points(session: Session) -> list[NetWorthPoint]:
             net_worth=row.net_worth,
             label=row.as_of_date.isoformat(),
         )
-        for row in sorted(list_snapshots(session), key=lambda r: r.as_of_date)
+        for row in sorted(list_snapshots(session, currency=currency),
+                          key=lambda r: r.as_of_date)
     ]
 
 
@@ -201,8 +232,9 @@ def projection(session: Session, months: int = 24, *,
 
 
 def emergency_fund_months(session: Session, monthly_expenses: Decimal,
-                          today: Optional[date] = None) -> Optional[Decimal]:
+                          today: Optional[date] = None,
+                          currency: Optional[str] = None) -> Optional[Decimal]:
     from services.account_service import balance_views, totals as account_totals
 
     views = balance_views(session, as_of=today)
-    return liquidity_ratio(account_totals(views).cash, monthly_expenses)
+    return liquidity_ratio(account_totals(views, currency).cash, monthly_expenses)

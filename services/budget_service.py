@@ -18,12 +18,13 @@ from calculations.budgeting import (
 )
 from calculations.cashflow import (
     IncomeTiming,
+    accounts_in,
     available_income_for_period,
     cash_available,
     income_timing,
 )
 from calculations.money import ZERO, D, money, money_sum, pct_of
-from calculations.periods import Period, period_from_key, previous_period, shift_period
+from calculations.periods import Period, period_from_key
 from calculations.variance import (
     STATUS_UNBUDGETED,
     VarianceRow,
@@ -54,6 +55,7 @@ from database.models import (
 )
 from schemas.validation import BudgetLineIn
 from services.common import (
+    with_default_currency,
     ConflictError,
     NotFoundError,
     ServiceError,
@@ -178,7 +180,7 @@ def upsert_line(session: Session, year: int, month: int, payload: dict[str, Any]
         raise ConflictError(
             f"{period_row.key} is closed. Reopen it before changing the plan."
         )
-    data = BudgetLineIn(**payload)
+    data = BudgetLineIn(**with_default_currency(session, payload))
     if data.category_id:
         category = session.get(Category, data.category_id)
         if category is None:
@@ -248,10 +250,11 @@ def clear_period_lines(session: Session, year: int, month: int,
 # Carry-in / available money
 # ==========================================================================
 def projected_cash_at(session: Session, on_date: date,
-                      *, today: Optional[date] = None) -> Decimal:
+                      *, today: Optional[date] = None,
+                      currency: Optional[str] = None) -> Decimal:
     """Cash on a date: real history up to today, planned movements after it."""
     today = today or date.today()
-    accounts = load_account_infos(session)
+    accounts = accounts_in(load_account_infos(session), currency)
     txns = load_cash_txns(session)
     if on_date <= today:
         return cash_available(accounts, txns, on_date)
@@ -275,12 +278,13 @@ def projected_cash_at(session: Session, on_date: date,
             if from_cash and not to_cash:
                 delta -= txn.amount
             elif to_cash and not from_cash:
-                delta += txn.amount
+                delta += txn.credited_amount
     return money(base + delta)
 
 
 def carry_in_for(session: Session, period: Period, *,
-                 today: Optional[date] = None) -> Decimal:
+                 today: Optional[date] = None,
+                 currency: Optional[str] = None) -> Decimal:
     """Money genuinely free to budget when the period opens.
 
     Raw cash minus anything already earmarked for a goal that lives in a cash
@@ -295,8 +299,11 @@ def carry_in_for(session: Session, period: Period, *,
         return ZERO
     from services.goal_service import earmarked_in_cash
 
-    cash = projected_cash_at(session, period.start - timedelta(days=1), today=today)
-    return money(cash - earmarked_in_cash(session, today=today))
+    # Both terms must be scoped to the same currency, or a euro goal would
+    # reduce the reais available to budget.
+    cash = projected_cash_at(session, period.start - timedelta(days=1),
+                             today=today, currency=currency)
+    return money(cash - earmarked_in_cash(session, today=today, currency=currency))
 
 
 # ==========================================================================
@@ -361,13 +368,22 @@ def _allocations_from_lines(session: Session, lines: Sequence[BudgetLine]) -> li
 
 
 def summarise_period(session: Session, period: Period,
-                     *, today: Optional[date] = None) -> BudgetSummary:
-    """Everything the Budget Planning screen needs for one period."""
+                     *, today: Optional[date] = None,
+                     currency: Optional[str] = None) -> BudgetSummary:
+    """Everything the Budget Planning screen needs for one period.
+
+    Zero-based balance is a per-currency identity: income plus carry-in minus
+    allocations only reaches zero within one denomination. Under a filter the
+    lines, the carry-in and the earmarks are all scoped together.
+    """
     settings = settings_snapshot(session)
     row = get_period_row(session, period.year, period.month)
     lines = lines_for_period(session, row) if row is not None else []
+    if currency is not None:
+        code = currency.upper()
+        lines = [line for line in lines if (line.currency or "").upper() == code]
     allocations = _allocations_from_lines(session, lines)
-    carry = carry_in_for(session, period, today=today)
+    carry = carry_in_for(session, period, today=today, currency=currency)
     result = zero_based_summary(allocations, carry)
 
     txns = load_cash_txns(session)
@@ -598,43 +614,6 @@ def copy_period(
     return report
 
 
-def generate_range(
-    session: Session,
-    start: Period,
-    count: int,
-    *,
-    source: str = "rules",
-    template_period: Optional[Period] = None,
-    growth_pct: Decimal = ZERO,
-    overwrite_overrides: bool = False,
-) -> list[PlanGenerationReport]:
-    """Plan several consecutive periods in one go.
-
-    ``source="rules"`` derives each period from the recurrence engine (so
-    annual, quarterly and seasonal items land in the right months);
-    ``source="copy"`` repeats a template period with optional yearly growth.
-    """
-    settings = settings_snapshot(session)
-    reports: list[PlanGenerationReport] = []
-    count = max(1, min(int(count), 60))
-    for offset in range(count):
-        period = shift_period(start, offset, settings.first_day_of_month)
-        if source == "copy":
-            template = template_period or previous_period(start, settings.first_day_of_month)
-            #: Apply growth once per completed year of distance.
-            years = offset // 12
-            factor = D(growth_pct) * Decimal(years)
-            reports.append(copy_period(
-                session, template, period,
-                growth_pct=factor, overwrite_overrides=overwrite_overrides,
-            ))
-        else:
-            reports.append(generate_from_rules(
-                session, period, overwrite_overrides=overwrite_overrides
-            ))
-    return reports
-
-
 # ==========================================================================
 # Tracking (planned vs actual)
 # ==========================================================================
@@ -682,13 +661,19 @@ def track_period(
     *,
     today: Optional[date] = None,
     include_planned_actuals: bool = False,
+    currency: Optional[str] = None,
 ) -> TrackingResult:
     """Compare the plan with what actually happened, category by category."""
     settings = settings_snapshot(session)
     today = today or date.today()
     row = get_period_row(session, period.year, period.month)
     lines = lines_for_period(session, row) if row is not None else []
-    actuals = actuals_for_period(session, period, include_planned=include_planned_actuals)
+    if currency is not None:
+        code = currency.upper()
+        lines = [line for line in lines if (line.currency or "").upper() == code]
+    actuals = actuals_for_period(session, period,
+                                 include_planned=include_planned_actuals,
+                                 currency=currency)
 
     names = category_name_map(session)
     goals = {r[0]: r[1] for r in session.execute(select(Goal.id, Goal.name)).all()}
@@ -755,22 +740,3 @@ def approaching_limits(session: Session, period: Period) -> list[VarianceRow]:
         settings.warning_threshold_pct,
         settings.critical_threshold_pct,
     )
-
-
-def budget_accuracy_series(session: Session, periods: Sequence[Period]) -> list[dict[str, Any]]:
-    """Accuracy of the plan for each closed period — was the budget realistic?"""
-    output: list[dict[str, Any]] = []
-    for period in periods:
-        tracking = track_period(session, period)
-        allocations = summarise(tracking.allocation_rows)
-        output.append({
-            "period": period.key,
-            "label": period.short_label,
-            "income_accuracy": tracking.income.accuracy_pct,
-            "expense_accuracy": allocations.accuracy_pct,
-            "planned_out": allocations.planned,
-            "actual_out": allocations.actual,
-            "planned_in": tracking.income.planned,
-            "actual_in": tracking.income.actual,
-        })
-    return output

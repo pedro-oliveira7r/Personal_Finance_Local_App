@@ -50,6 +50,9 @@ class SettingsSnapshot:
     """Immutable copy of user preferences, safe to pass around and cache."""
 
     base_currency: str = "BRL"
+    #: Every currency this book uses, primary first. A tuple so the frozen
+    #: dataclass stays hashable.
+    active_currencies: tuple[str, ...] = ("BRL",)
     date_format: str = "DD/MM/YYYY"
     date_pattern: str = "%d/%m/%Y"
     show_cents: bool = True
@@ -77,6 +80,23 @@ class SettingsSnapshot:
         return self.period_for(today or date.today())
 
 
+def _active_currencies(row: AppSettings) -> tuple[str, ...]:
+    """The book's currencies, primary first, tolerant of a missing/odd column.
+
+    An un-migrated or hand-edited row yields just the primary rather than an
+    exception — settings are read on every rerun and must never be the thing
+    that stops the app opening.
+    """
+    primary = (row.base_currency or "BRL").upper()
+    stored = row.active_currencies if isinstance(row.active_currencies, list) else []
+    codes = [primary]
+    for code in stored:
+        text = str(code).upper()
+        if text != primary and text not in codes:
+            codes.append(text)
+    return tuple(codes[:3])
+
+
 def settings_snapshot(session: Session) -> SettingsSnapshot:
     from constants import DATE_FORMATS
 
@@ -88,6 +108,7 @@ def settings_snapshot(session: Session) -> SettingsSnapshot:
         session.commit()
     return SettingsSnapshot(
         base_currency=row.base_currency,
+        active_currencies=_active_currencies(row),
         date_format=row.date_format,
         date_pattern=DATE_FORMATS.get(row.date_format, "%d/%m/%Y"),
         show_cents=row.show_cents,
@@ -166,6 +187,30 @@ def load_account_infos(session: Session, *, include_archived: bool = True) -> li
     ]
 
 
+def with_default_currency(session: Session, payload: dict) -> dict:
+    """Fill an absent ``currency`` with the book's primary.
+
+    The pydantic default is the literal ``"BRL"`` — it has no session and so no
+    way to know the book. Leaving that default in place would stamp BRL onto
+    every goal and debt of a euro-based book.
+    """
+    if payload.get("currency"):
+        return payload
+    from services.currency_service import active_currencies
+
+    return {**payload, "currency": active_currencies(session)[0]}
+
+
+def account_currency_map(session: Session) -> dict[int, str]:
+    """``{account_id: currency}`` for the whole book, archived included."""
+    from database.models import Account
+
+    return {
+        row.id: row.currency
+        for row in session.execute(select(Account.id, Account.currency))
+    }
+
+
 def load_cash_txns(
     session: Session,
     *,
@@ -175,6 +220,9 @@ def load_cash_txns(
 ) -> list[CashTxn]:
     """Every active transaction as a :class:`CashTxn`, ready for the maths."""
     kinds = category_kind_map(session)
+    # One lookup for the whole book. Reading ``txn.account.currency`` per row
+    # would issue a query per transaction on any book big enough to matter.
+    currencies = account_currency_map(session)
     stmt = (
         select(Transaction)
         .where(Transaction.deleted_at.is_(None))
@@ -203,6 +251,8 @@ def load_cash_txns(
             category_id=txn.category_id,
             category_kind=kinds.get(txn.category_id) if txn.category_id else None,
             exclude_from_budget=txn.exclude_from_budget,
+            to_amount=txn.to_amount,
+            currency=currencies.get(txn.account_id),
         ))
     return result
 

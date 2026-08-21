@@ -1,4 +1,4 @@
-"""Forecast chaining, sources, earmarks, scenarios and alerts."""
+"""Forecast chaining, sources, earmarks and alerts."""
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from calculations.forecasting import (
     lowest_point,
     negative_periods,
     runway_periods,
-    scenario,
 )
 from calculations.periods import make_period, period_sequence
 
@@ -205,39 +204,6 @@ def test_average_of_empty_history_is_zero():
     average = average_assumption([], months=6)
     assert average.income == Decimal("0.00")
     assert average.source == SOURCE_AVERAGE
-
-
-# --------------------------------------------------------------------------
-# Scenarios
-# --------------------------------------------------------------------------
-def test_scenario_scales_income_and_expenses():
-    window = periods(2)
-    rows = build_forecast(window, Decimal("0"),
-                          {p.key: assumption(p.key, income="5000", expenses="4000")
-                           for p in window},
-                          today=date(2026, 8, 15))
-    worse = scenario(rows, income_pct=Decimal("-10"), expense_pct=Decimal("10"),
-                     today=date(2026, 8, 15))
-    assert worse[0].assumption.income == Decimal("4500.00")
-    assert worse[0].assumption.expenses == Decimal("4400.00")
-    assert worse[0].net_flow == Decimal("100.00")
-
-
-def test_scenario_injects_a_one_off_expense():
-    window = periods(3)
-    rows = build_forecast(window, Decimal("1000"),
-                          {p.key: assumption(p.key, income="3000", expenses="2500")
-                           for p in window},
-                          today=date(2026, 8, 15))
-    with_purchase = scenario(rows, one_off={window[1].key: Decimal("4000")},
-                             today=date(2026, 8, 15))
-    assert with_purchase[1].assumption.expenses == Decimal("6500.00")
-    assert with_purchase[1].closing_cash < rows[1].closing_cash
-    assert first_negative(with_purchase) is not None
-
-
-def test_scenario_on_an_empty_forecast_is_empty():
-    assert scenario([], income_pct=Decimal("10")) == []
 
 
 # --------------------------------------------------------------------------

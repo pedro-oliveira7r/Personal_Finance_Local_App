@@ -17,6 +17,7 @@ from constants import CategoryKind, GoalStatus, TxnKind, TxnStatus
 from database.models import Account, Category, Goal, Transaction
 from schemas.validation import GoalIn
 from services.common import (
+    with_default_currency,
     ConflictError,
     NotFoundError,
     ServiceError,
@@ -25,7 +26,12 @@ from services.common import (
     send_to_recycle_bin,
     settings_snapshot,
 )
-from services.transaction_service import TxnFilter, create_transaction, list_transactions
+from services.transaction_service import (
+    TxnFilter,
+    create_transaction,
+    create_transfer,
+    list_transactions,
+)
 
 
 def list_goals(session: Session, *, statuses: Optional[Sequence[str]] = None) -> list[Goal]:
@@ -47,7 +53,7 @@ def get_goal(session: Session, goal_id: int) -> Goal:
 
 
 def create_goal(session: Session, payload: dict[str, Any]) -> Goal:
-    data = GoalIn(**payload)
+    data = GoalIn(**with_default_currency(session, payload))
     ensure_exists(session, Account, data.account_id, "Account")
     ensure_exists(session, Category, data.category_id, "Category")
     clash = session.execute(
@@ -106,6 +112,17 @@ def delete_goal(session: Session, goal_id: int, *, force: bool = False) -> dict[
 # --------------------------------------------------------------------------
 # Contributions
 # --------------------------------------------------------------------------
+def _credited(txn) -> Decimal:
+    """What the goal actually received, in the goal's own currency.
+
+    A contribution paid from an account in another currency leaves as one
+    magnitude and lands as a different one; the goal is funded by the second.
+    """
+    if txn.kind == TxnKind.TRANSFER.value and txn.to_amount is not None:
+        return money(txn.to_amount)
+    return money(txn.amount)
+
+
 def contributions_total(session: Session, goal_id: int,
                         *, up_to: Optional[date] = None) -> Decimal:
     """Everything actually paid into the goal (completed transactions only)."""
@@ -113,7 +130,7 @@ def contributions_total(session: Session, goal_id: int,
         goal_id=goal_id, statuses=[TxnStatus.COMPLETED.value],
         end=up_to, use_effective_date=True,
     ))
-    return money_sum(txn.amount for txn in txns)
+    return money_sum(_credited(txn) for txn in txns)
 
 
 def contributions_in_period(session: Session, goal_id: int, period: Period) -> Decimal:
@@ -121,7 +138,7 @@ def contributions_in_period(session: Session, goal_id: int, period: Period) -> D
         goal_id=goal_id, statuses=[TxnStatus.COMPLETED.value],
         start=period.start, end=period.end, use_effective_date=True,
     ))
-    return money_sum(txn.amount for txn in txns)
+    return money_sum(_credited(txn) for txn in txns)
 
 
 def average_monthly_contribution(session: Session, goal_id: int,
@@ -151,6 +168,7 @@ def record_contribution(
     from_account_id: Optional[int] = None,
     description: Optional[str] = None,
     allow_duplicate: bool = False,
+    to_amount: Optional[Decimal] = None,
 ) -> Transaction:
     """Record money going into a goal.
 
@@ -166,13 +184,13 @@ def record_contribution(
     label = description or f"Contribution · {goal.name}"
 
     if goal.account_id and from_account_id and goal.account_id != from_account_id:
-        return create_transaction(session, {
+        return create_transfer(session, {
             "txn_date": on_date,
             "description": label,
             "amount": amount,
-            "kind": TxnKind.TRANSFER.value,
+            "to_amount": to_amount,
             "status": TxnStatus.COMPLETED.value,
-            "account_id": from_account_id,
+            "from_account_id": from_account_id,
             "to_account_id": goal.account_id,
             "goal_id": goal_id,
         }, allow_duplicate=allow_duplicate)
@@ -226,21 +244,31 @@ def progress_for(session: Session, goal: Goal, *, today: Optional[date] = None,
 
 
 def all_progress(session: Session, *, today: Optional[date] = None,
-                 statuses: Optional[Sequence[str]] = None) -> list[GoalProgress]:
+                 statuses: Optional[Sequence[str]] = None,
+                 currency: Optional[str] = None) -> list[GoalProgress]:
     goals = list_goals(session, statuses=statuses or [GoalStatus.ACTIVE.value])
+    if currency is not None:
+        code = currency.upper()
+        goals = [g for g in goals if (g.currency or "").upper() == code]
     return [progress_for(session, goal, today=today) for goal in goals]
 
 
-def earmarked_in_cash(session: Session, *, today: Optional[date] = None) -> Decimal:
+def earmarked_in_cash(session: Session, *, today: Optional[date] = None,
+                      currency: Optional[str] = None) -> Decimal:
     """Goal money that physically sits in a cash-like account.
 
     This is the amount that must be subtracted from raw cash before asking
     "how much do I have left to budget?" — otherwise the emergency fund gets
     re-allocated every single month.
+
+    ``currency`` must match whatever the cash side was scoped to; subtracting a
+    euro goal from a pool of reais is arithmetic nonsense that still renders as
+    a plausible number.
     """
     from constants import CASH_ACCOUNT_TYPES
     from database.models import Account
 
+    code = currency.upper() if currency else None
     cash_ids = {
         row[0] for row in session.execute(
             select(Account.id, Account.type, Account.include_in_cash)
@@ -251,12 +279,15 @@ def earmarked_in_cash(session: Session, *, today: Optional[date] = None) -> Deci
     for goal in list_goals(session, statuses=[GoalStatus.ACTIVE.value]):
         if goal.account_id is not None and goal.account_id not in cash_ids:
             continue
+        if code is not None and (goal.currency or "").upper() != code:
+            continue
         total = money(total + current_amount(session, goal))
     return total
 
 
-def totals(session: Session, *, today: Optional[date] = None) -> dict[str, Decimal]:
-    progresses = all_progress(session, today=today)
+def totals(session: Session, *, today: Optional[date] = None,
+           currency: Optional[str] = None) -> dict[str, Decimal]:
+    progresses = all_progress(session, today=today, currency=currency)
     return {
         "target": money_sum(p.target_amount for p in progresses),
         "saved": money_sum(p.current_amount for p in progresses),
@@ -272,9 +303,16 @@ def alerts(session: Session, *, today: Optional[date] = None) -> list[tuple[str,
 
 
 def suggest_distribution(session: Session, available: Decimal,
-                         *, today: Optional[date] = None) -> list[tuple[GoalProgress, Decimal]]:
-    """Split spare money across goals by urgency."""
-    return prioritise(all_progress(session, today=today), available)
+                         *, today: Optional[date] = None,
+                         currency: Optional[str] = None) -> list[tuple[GoalProgress, Decimal]]:
+    """Split spare money across goals by urgency.
+
+    ``currency`` matters: the pool being handed out is denominated in one
+    currency, and ``prioritise`` ranks goals by how short they are. Mixing
+    denominations would rank a €500 shortfall against an R$500 one as equals
+    and then allocate reais to a euro goal.
+    """
+    return prioritise(all_progress(session, today=today, currency=currency), available)
 
 
 def auto_close_achieved(session: Session, *, today: Optional[date] = None) -> list[str]:

@@ -11,11 +11,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from calculations.budgeting import savings_rate
 from calculations.cashflow import (
+    accounts_in,
     PeriodCashflow,
     cash_available,
     cashflow_series,
@@ -23,7 +24,7 @@ from calculations.cashflow import (
     period_cashflow,
     upcoming_outflows,
 )
-from calculations.money import ZERO, D, money, money_sum, pct_of
+from calculations.money import ZERO, money, money_sum, pct_of
 from calculations.periods import Period, quarter_of_month, shift_period
 from calculations.variance import (
     VarianceRow,
@@ -33,13 +34,12 @@ from calculations.variance import (
     top_overspending,
     top_underspending,
 )
-from constants import CategoryKind, Severity, TxnKind, TxnStatus
+from constants import CategoryKind, Severity, TxnKind
 from database.models import Category, Transaction
 from services import account_service, debt_service, goal_service, networth_service
 from services.budget_service import (
     BudgetSummary,
     TrackingResult,
-    budget_accuracy_series,
     carry_in_for,
     summarise_period,
     track_period,
@@ -51,9 +51,7 @@ from services.common import (
     settings_snapshot,
 )
 from services.transaction_service import (
-    TxnFilter,
     actuals_for_period,
-    list_transactions,
     overdue_planned,
     upcoming_planned,
 )
@@ -63,11 +61,12 @@ from services.transaction_service import (
 # History
 # ==========================================================================
 def period_history(session: Session, periods: Sequence[Period],
-                   *, today: Optional[date] = None) -> list[dict[str, Any]]:
+                   *, today: Optional[date] = None,
+                   currency: Optional[str] = None) -> list[dict[str, Any]]:
     """One row per period with the headline figures, oldest first."""
     settings = settings_snapshot(session)
     today = today or date.today()
-    accounts = load_account_infos(session)
+    accounts = accounts_in(load_account_infos(session), currency)
     txns = load_cash_txns(session)
     flows = cashflow_series(
         periods, accounts, txns,
@@ -119,13 +118,16 @@ def trailing_periods(session: Session, months: int = 12,
 
 
 def trailing_history(session: Session, months: int = 12,
-                     today: Optional[date] = None) -> list[dict[str, Any]]:
-    return period_history(session, trailing_periods(session, months, today), today=today)
+                     today: Optional[date] = None,
+                     currency: Optional[str] = None) -> list[dict[str, Any]]:
+    return period_history(session, trailing_periods(session, months, today),
+                          today=today, currency=currency)
 
 
 def averages(session: Session, months: int = 6,
-             today: Optional[date] = None) -> dict[str, Decimal]:
-    rows = [row for row in trailing_history(session, months + 1, today)][:-1] or []
+             today: Optional[date] = None,
+             currency: Optional[str] = None) -> dict[str, Decimal]:
+    rows = [row for row in trailing_history(session, months + 1, today, currency)][:-1] or []
     if not rows:
         return {key: ZERO for key in
                 ("income", "expenses", "savings", "investments", "debt_payments", "net")}
@@ -138,53 +140,15 @@ def averages(session: Session, months: int = 6,
     return result
 
 
-def compare_periods(session: Session, current: Period, previous: Period) -> dict[str, Any]:
-    """Side-by-side of two periods with deltas — used for MoM and YoY."""
-    rows = period_history(session, [previous, current])
-    if len(rows) < 2:
-        return {}
-    before, after = rows[0], rows[1]
-    keys = ("income", "expenses", "savings", "investments", "debt_payments", "net")
-    deltas = {
-        key: {
-            "previous": before[key],
-            "current": after[key],
-            "change": money(D(after[key]) - D(before[key])),
-            "change_pct": pct_of(money(D(after[key]) - D(before[key])), before[key]),
-        }
-        for key in keys
-    }
-    return {
-        "current_label": current.label,
-        "previous_label": previous.label,
-        "metrics": deltas,
-    }
-
-
-def month_over_month(session: Session, period: Optional[Period] = None,
-                     today: Optional[date] = None) -> dict[str, Any]:
-    settings = settings_snapshot(session)
-    period = period or settings.current_period(today or date.today())
-    return compare_periods(session, period,
-                           shift_period(period, -1, settings.first_day_of_month))
-
-
-def year_over_year(session: Session, period: Optional[Period] = None,
-                   today: Optional[date] = None) -> dict[str, Any]:
-    settings = settings_snapshot(session)
-    period = period or settings.current_period(today or date.today())
-    return compare_periods(session, period,
-                           shift_period(period, -12, settings.first_day_of_month))
-
-
 # ==========================================================================
 # Category analysis
 # ==========================================================================
 def category_totals(session: Session, period: Period, *,
                     kinds: Optional[Sequence[str]] = None,
-                    roll_up: bool = True, limit: Optional[int] = None) -> list[dict[str, Any]]:
+                    roll_up: bool = True, limit: Optional[int] = None,
+                    currency: Optional[str] = None) -> list[dict[str, Any]]:
     """Spending per category inside a period, biggest first."""
-    actuals = actuals_for_period(session, period)
+    actuals = actuals_for_period(session, period, currency=currency)
     names = category_name_map(session)
     rows = session.execute(select(Category.id, Category.kind, Category.parent_id,
                                  Category.name, Category.color)).all()
@@ -254,77 +218,6 @@ def category_trend(session: Session, category_ids: Sequence[int],
     return output
 
 
-def recurring_patterns(session: Session, months: int = 6,
-                       today: Optional[date] = None) -> list[dict[str, Any]]:
-    """Categories you spend on nearly every month — the true fixed cost base."""
-    periods = trailing_periods(session, months, today, include_current=False)
-    if not periods:
-        return []
-    names = category_name_map(session)
-    tallies: dict[int, list[Decimal]] = {}
-    for period in periods:
-        actuals = actuals_for_period(session, period)
-        for category_id, amount in actuals.by_category.items():
-            tallies.setdefault(category_id, []).append(amount)
-
-    output: list[dict[str, Any]] = []
-    for category_id, amounts in tallies.items():
-        appearances = len(amounts)
-        if appearances < max(2, len(periods) - 1):
-            continue
-        average = money(money_sum(amounts) / Decimal(appearances))
-        spread = money(max(amounts) - min(amounts))
-        output.append({
-            "category_id": category_id,
-            "label": names.get(category_id, f"#{category_id}"),
-            "months_present": appearances,
-            "months_analysed": len(periods),
-            "average": average,
-            "minimum": min(amounts),
-            "maximum": max(amounts),
-            "spread": spread,
-            "volatility_pct": pct_of(spread, average),
-        })
-    output.sort(key=lambda row: row["average"], reverse=True)
-    return output
-
-
-def biggest_transactions(session: Session, period: Period, limit: int = 10) -> list[Transaction]:
-    txns = list_transactions(session, TxnFilter(
-        start=period.start, end=period.end,
-        kinds=[TxnKind.EXPENSE.value],
-        statuses=[TxnStatus.COMPLETED.value],
-        use_effective_date=True,
-    ))
-    return sorted(txns, key=lambda txn: txn.amount, reverse=True)[:limit]
-
-
-def unusual_expenses(session: Session, period: Period, *, months: int = 6,
-                     threshold_pct: Decimal = Decimal("50"),
-                     today: Optional[date] = None) -> list[dict[str, Any]]:
-    """Categories markedly above their own recent average."""
-    baseline = recurring_patterns(session, months, today)
-    lookup = {row["category_id"]: row for row in baseline}
-    actuals = actuals_for_period(session, period)
-    names = category_name_map(session)
-    output: list[dict[str, Any]] = []
-    for category_id, amount in actuals.by_category.items():
-        base = lookup.get(category_id)
-        if base is None or base["average"] <= 0:
-            continue
-        change = pct_of(money(amount - base["average"]), base["average"])
-        if change >= D(threshold_pct):
-            output.append({
-                "category_id": category_id,
-                "label": names.get(category_id, f"#{category_id}"),
-                "amount": amount,
-                "average": base["average"],
-                "change_pct": change,
-            })
-    output.sort(key=lambda row: row["change_pct"], reverse=True)
-    return output
-
-
 # ==========================================================================
 # Dashboard snapshot
 # ==========================================================================
@@ -383,17 +276,100 @@ class DashboardSnapshot:
             self.budget and self.budget.has_plan)
 
 
+#: Snapshot fields that are money in the filtered currency and therefore
+#: convertible. Percentages, counts and month-spans are recomputed, not summed.
+_CONVERTIBLE_FIELDS = (
+    "cash", "net_worth", "total_assets", "total_liabilities", "total_savings",
+    "total_investments", "total_debt", "income_actual", "income_planned",
+    "expenses_actual", "expenses_planned", "savings_actual", "savings_planned",
+    "net_cash_flow", "available_to_budget", "unallocated",
+)
+
+#: The same idea for one period's cash flow.
+_CONVERTIBLE_FLOW_FIELDS = (
+    "opening_cash", "income_received", "income_available", "income_earned",
+    "expenses_paid", "transfers_in", "transfers_out", "savings_contributed",
+    "investments_contributed", "debt_paid", "net_flow", "closing_cash",
+)
+
+
+def dashboard_combined(session: Session, period: Optional[Period] = None,
+                       today: Optional[date] = None,
+                       *, book=None) -> DashboardSnapshot:
+    """Every currency, converted into the primary and added up.
+
+    Built by computing a real per-currency snapshot and converting it, rather
+    than by converting transactions on the way in. Both give the same answer
+    while the rate is uniform, and this way each currency's own figures stay
+    exact and auditable — the conversion happens once per headline number.
+
+    Ratios (savings rate, budget utilisation) are **recomputed** from the
+    converted totals. Averaging percentages across currencies would weight a
+    small euro balance the same as a large real one.
+    """
+    from services.currency_service import book as currency_book
+
+    settings = settings_snapshot(session)
+    today = today or date.today()
+    period = period or settings.current_period(today)
+    book = book or currency_book(session)
+
+    parts = [(code, dashboard(session, period, today, currency=code))
+             for code in book.active]
+    combined = dashboard(session, period, today, currency=book.primary)
+
+    for name in _CONVERTIBLE_FIELDS:
+        setattr(combined, name, money_sum(
+            book.convert(getattr(part, name), code, book.primary)
+            for code, part in parts
+        ))
+    if combined.flow is not None:
+        for name in _CONVERTIBLE_FLOW_FIELDS:
+            setattr(combined.flow, name, money_sum(
+                book.convert(getattr(part.flow, name), code, book.primary)
+                for code, part in parts if part.flow is not None
+            ))
+
+    combined.savings_rate_pct = savings_rate(
+        combined.income_actual, combined.savings_actual)
+    planned_out = money_sum(
+        book.convert(
+            money(part.expenses_planned + part.savings_planned), code, book.primary)
+        for code, part in parts
+    )
+    actual_out = money_sum(
+        book.convert(
+            money(part.expenses_actual + part.savings_actual), code, book.primary)
+        for code, part in parts
+    )
+    combined.budget_utilisation_pct = pct_of(actual_out, planned_out)
+
+    # Alerts are per-currency statements of fact; concatenating them keeps each
+    # one true in its own denomination rather than inventing a converted one.
+    combined.alerts = [alert for _, part in parts for alert in part.alerts]
+    combined.upcoming = [t for _, part in parts for t in part.upcoming]
+    combined.overdue = [t for _, part in parts for t in part.overdue]
+    return combined
+
+
 def dashboard(session: Session, period: Optional[Period] = None,
-              today: Optional[date] = None) -> DashboardSnapshot:
-    """Everything the Dashboard needs, computed once."""
+              today: Optional[date] = None,
+              currency: Optional[str] = None) -> DashboardSnapshot:
+    """Everything the Dashboard needs, computed once.
+
+    Every figure on the snapshot is a scalar, so on a mixed book they are only
+    meaningful once ``currency`` narrows them to one denomination. ``None``
+    keeps the pre-multi-currency behaviour and is correct for a single-currency
+    book.
+    """
     settings = settings_snapshot(session)
     today = today or date.today()
     period = period or settings.current_period(today)
 
-    accounts = load_account_infos(session)
+    accounts = accounts_in(load_account_infos(session), currency)
     txns = load_cash_txns(session)
     views = account_service.balance_views(session, as_of=today)
-    account_totals = account_service.totals(views)
+    account_totals = account_service.totals(views, currency)
 
     flow = period_cashflow(
         period, accounts, txns,
@@ -401,10 +377,10 @@ def dashboard(session: Session, period: Optional[Period] = None,
         cutoff_day=settings.income_cutoff_day,
         first_day_of_month=settings.first_day_of_month,
     )
-    budget = summarise_period(session, period, today=today)
-    tracking = track_period(session, period, today=today)
-    debt_summary = debt_service.totals(session)
-    goals = goal_service.all_progress(session, today=today)
+    budget = summarise_period(session, period, today=today, currency=currency)
+    tracking = track_period(session, period, today=today, currency=currency)
+    debt_summary = debt_service.totals(session, currency=currency)
+    goals = goal_service.all_progress(session, today=today, currency=currency)
 
     snapshot = DashboardSnapshot(period=period, today=today, flow=flow,
                                 budget=budget, tracking=tracking)
@@ -436,9 +412,9 @@ def dashboard(session: Session, period: Optional[Period] = None,
     snapshot.available_to_budget = budget.result.available
     snapshot.unallocated = budget.result.unallocated
 
-    monthly_average = averages(session, 6, today)
+    monthly_average = averages(session, 6, today, currency)
     snapshot.emergency_months = networth_service.emergency_fund_months(
-        session, monthly_average["expenses"], today
+        session, monthly_average["expenses"], today, currency
     )
 
     snapshot.top_overspend = top_overspending(tracking.allocation_rows)
@@ -557,39 +533,3 @@ def build_alerts(session: Session, snapshot: DashboardSnapshot, *,
              Severity.INFO.value: 2, Severity.SUCCESS.value: 3}
     alerts.sort(key=lambda item: order.get(item.severity, 9))
     return alerts
-
-
-# ==========================================================================
-# Report tables
-# ==========================================================================
-def budget_accuracy(session: Session, months: int = 12,
-                    today: Optional[date] = None) -> list[dict[str, Any]]:
-    periods = trailing_periods(session, months, today, include_current=False)
-    return budget_accuracy_series(session, periods)
-
-
-def annual_summary(session: Session, year: int) -> dict[str, Any]:
-    settings = settings_snapshot(session)
-    periods = [settings.period(year, month) for month in range(1, 13)]
-    rows = period_history(session, periods)
-    return {
-        "year": year,
-        "rows": rows,
-        "income": money_sum(row["income"] for row in rows),
-        "expenses": money_sum(row["expenses"] for row in rows),
-        "savings": money_sum(row["savings"] for row in rows),
-        "investments": money_sum(row["investments"] for row in rows),
-        "debt_payments": money_sum(row["debt_payments"] for row in rows),
-        "net": money_sum(row["net"] for row in rows),
-    }
-
-
-def available_years(session: Session) -> list[int]:
-    rows = session.execute(
-        select(func.min(Transaction.txn_date), func.max(Transaction.txn_date))
-        .where(Transaction.deleted_at.is_(None))
-    ).first()
-    today = date.today()
-    if not rows or rows[0] is None:
-        return [today.year]
-    return list(range(rows[0].year, max(rows[1].year, today.year) + 1))

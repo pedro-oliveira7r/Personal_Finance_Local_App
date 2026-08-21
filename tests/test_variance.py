@@ -17,7 +17,6 @@ from calculations.variance import (
     approaching_limit,
     compute_variance,
     income_shortfalls,
-    pace_projection,
     summarise,
     top_overspending,
     top_underspending,
@@ -149,20 +148,6 @@ def test_summarise_totals_and_counts():
     assert summary.unfavorable_count == 1
 
 
-def test_accuracy_is_100_when_the_plan_matched():
-    rows = [expense("1000", "1000")]
-    assert summarise(rows).accuracy_pct == Decimal("100.00")
-
-
-def test_accuracy_never_goes_negative():
-    rows = [expense("100", "1000")]
-    assert summarise(rows).accuracy_pct == Decimal("0.00")
-
-
-def test_accuracy_with_nothing_planned_is_zero():
-    assert summarise([expense("0", "500")]).accuracy_pct == Decimal("0.00")
-
-
 def test_top_overspending_and_underspending_ordering():
     rows = [
         expense("100", "400", label="Delivery"),
@@ -201,17 +186,3 @@ def test_variance_table_builds_rows_from_dicts():
     assert rows[0].status == STATUS_OVER
     assert rows[1].status == STATUS_OK
     assert rows[0].as_dict()["variance"] == Decimal("100.00")
-
-
-# --------------------------------------------------------------------------
-# Pace
-# --------------------------------------------------------------------------
-def test_pace_projection_extrapolates_to_the_period_end():
-    row = expense("1000", "500")
-    assert pace_projection(row, 0.5) == Decimal("1000.00")
-    assert pace_projection(row, 0.25) == Decimal("2000.00")
-
-
-def test_pace_projection_at_the_start_of_a_period_returns_actual():
-    row = expense("1000", "0")
-    assert pace_projection(row, 0.0) == Decimal("0.00")

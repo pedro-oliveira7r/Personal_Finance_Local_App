@@ -135,20 +135,52 @@ def _coerce(value: Any, kind: str) -> Any:
 
 
 def _total_row(sheet: Worksheet, row: int, spec: SheetSpec, first_data_row: int,
-               currency: str, label: str = "TOTAL") -> None:
-    money_fmt = currency_format(currency)
+               currency: str, label: str = "TOTAL",
+               currencies: Optional[Sequence[str]] = None) -> int:
+    """Write the totals under a sheet, one row per currency.
+
+    A single ``=SUM()`` down a money column is not merely wrong over mixed
+    rows — it is *confidently* wrong, formatted with one currency's mask so it
+    reads as "R$ 47.320,00" over a column of euros. With more than one currency
+    present the totals become ``=SUMIF()`` keyed on the sheet's own Currency
+    column, so each line adds only what belongs to it.
+
+    Returns the next free row.
+    """
     last = row - 1
-    sheet.cell(row=row, column=1, value=label).font = TOTAL_FONT
-    for index, (_header, kind, _width) in enumerate(spec.columns, start=1):
-        cell = sheet.cell(row=row, column=index)
-        cell.border = TOP_RULE
-        if index == 1:
-            continue
-        if kind == "money" and last >= first_data_row:
+    if last < first_data_row:
+        return row
+
+    codes = [c for c in (currencies or []) if c]
+    currency_index = next(
+        (i for i, (header, _kind, _w) in enumerate(spec.columns, start=1)
+         if header == "Currency"), None)
+    if len(codes) < 2 or currency_index is None:
+        codes = [currency]
+        currency_index = None
+
+    key_letter = get_column_letter(currency_index) if currency_index else None
+    for offset, code in enumerate(codes):
+        target = row + offset
+        money_fmt = currency_format(code)
+        title = label if len(codes) == 1 else f"{label} · {code}"
+        sheet.cell(row=target, column=1, value=title).font = TOTAL_FONT
+        for index, (_header, kind, _width) in enumerate(spec.columns, start=1):
+            cell = sheet.cell(row=target, column=index)
+            cell.border = TOP_RULE
+            if index == 1 or kind != "money":
+                continue
             letter = get_column_letter(index)
-            cell.value = f"=SUM({letter}{first_data_row}:{letter}{last})"
+            if key_letter:
+                cell.value = (
+                    f'=SUMIF({key_letter}{first_data_row}:{key_letter}{last},'
+                    f'"{code}",{letter}{first_data_row}:{letter}{last})'
+                )
+            else:
+                cell.value = f"=SUM({letter}{first_data_row}:{letter}{last})"
             cell.number_format = money_fmt
             cell.font = TOTAL_FONT
+    return row + len(codes)
 
 
 # ==========================================================================
@@ -157,14 +189,15 @@ def _total_row(sheet: Worksheet, row: int, spec: SheetSpec, first_data_row: int,
 TXN_SPEC = SheetSpec("Transactions", [
     ("Date", "date", 12), ("Paid on", "date", 12), ("Description", "text", 40),
     ("Type", "text", 11), ("Status", "text", 11), ("Category", "text", 28),
-    ("Account", "text", 22), ("To account", "text", 20), ("Amount", "money", 15),
+    ("Account", "text", 22), ("To account", "text", 20),
+    ("Currency", "text", 10), ("Amount", "money", 15),
     ("Payment method", "text", 16), ("Tags", "text", 16), ("Planned", "text", 9),
     ("Notes", "text", 30),
 ])
 
 BUDGET_SPEC = SheetSpec("Budget", [
     ("Period", "text", 11), ("Type", "text", 12), ("Line", "text", 34),
-    ("Planned", "money", 15), ("Actual", "money", 15), ("Variance", "money", 15),
+    ("Currency", "text", 10), ("Planned", "money", 15), ("Actual", "money", 15), ("Variance", "money", 15),
     ("Variance %", "pct", 12), ("Consumed %", "pct", 12), ("Status", "text", 18),
 ])
 
@@ -182,7 +215,8 @@ ACCOUNT_SPEC = SheetSpec("Accounts", [
 ])
 
 GOAL_SPEC = SheetSpec("Goals", [
-    ("Goal", "text", 28), ("Type", "text", 20), ("Target", "money", 15),
+    ("Goal", "text", 28), ("Type", "text", 20), ("Currency", "text", 10),
+    ("Target", "money", 15),
     ("Saved", "money", 15), ("Remaining", "money", 15), ("Progress", "pct", 11),
     ("Planned monthly", "money", 16), ("Required monthly", "money", 16),
     ("Target date", "date", 13), ("Projected finish", "date", 15),
@@ -190,7 +224,8 @@ GOAL_SPEC = SheetSpec("Goals", [
 ])
 
 DEBT_SPEC = SheetSpec("Debts", [
-    ("Debt", "text", 28), ("Type", "text", 18), ("Balance", "money", 15),
+    ("Debt", "text", 28), ("Type", "text", 18), ("Currency", "text", 10),
+    ("Balance", "money", 15),
     ("Annual rate %", "text", 13), ("Minimum", "money", 14),
     ("Planned payment", "money", 16), ("Extra", "money", 12),
     ("Monthly interest", "money", 16), ("Months to payoff", "int", 15),
@@ -287,6 +322,12 @@ def _legend_sheet(workbook: Workbook, settings, today: date, months: int) -> Non
     note.font = NOTE_FONT
 
 
+def _active(session: Session) -> list[str]:
+    from services.currency_service import active_currencies
+
+    return list(active_currencies(session))
+
+
 def _transactions_sheet(workbook: Workbook, session: Session,
                         periods: Sequence[Period], currency: str) -> None:
     sheet = workbook.create_sheet(TXN_SPEC.title)
@@ -295,8 +336,9 @@ def _transactions_sheet(workbook: Workbook, session: Session,
     if not periods:
         return
     categories = category_name_map(session)
-    accounts = {a.id: a.name for a in account_service.list_accounts(
-        session, include_archived=True)}
+    all_accounts = account_service.list_accounts(session, include_archived=True)
+    accounts = {a.id: a.name for a in all_accounts}
+    account_currency = {a.id: a.currency for a in all_accounts}
     txns = list_transactions(session, TxnFilter(
         start=periods[0].start, end=periods[-1].end, order_desc=False,
     ))
@@ -306,12 +348,14 @@ def _transactions_sheet(workbook: Workbook, session: Session,
             categories.get(txn.category_id, "") if txn.category_id else "",
             accounts.get(txn.account_id, "") if txn.account_id else "",
             accounts.get(txn.to_account_id, "") if txn.to_account_id else "",
+            account_currency.get(txn.account_id, currency),
             txn.amount, txn.payment_method or "", txn.tags or "",
             "yes" if txn.is_planned else "no", txn.notes or "",
         ], currency)
         row += 1
     if row > first:
-        _total_row(sheet, row, TXN_SPEC, first, currency)
+        _total_row(sheet, row, TXN_SPEC, first, currency,
+                   currencies=_active(session))
 
 
 def _budget_sheet(workbook: Workbook, session: Session,
@@ -327,13 +371,15 @@ def _budget_sheet(workbook: Workbook, session: Session,
             consumed = f'=IF(D{row}=0,"",E{row}/D{row})'
             _write_row(sheet, row, BUDGET_SPEC, [
                 period.key, entry.kind, entry.label,
+                getattr(entry, "currency", None) or currency,
                 entry.planned, entry.actual,
                 variance_formula, variance_pct, consumed,
                 f"{entry.status_icon} {entry.status_label}",
             ], currency)
             row += 1
     if row > first:
-        _total_row(sheet, row, BUDGET_SPEC, first, currency)
+        _total_row(sheet, row, BUDGET_SPEC, first, currency,
+                   currencies=_active(session))
 
 
 def _history_sheet(workbook: Workbook, session: Session, periods: Sequence[Period],
@@ -369,7 +415,8 @@ def _accounts_sheet(workbook: Workbook, session: Session, currency: str) -> None
         ], currency)
         row += 1
     if row > first:
-        _total_row(sheet, row, ACCOUNT_SPEC, first, currency)
+        _total_row(sheet, row, ACCOUNT_SPEC, first, currency,
+                   currencies=_active(session))
 
 
 def _goals_sheet(workbook: Workbook, session: Session, currency: str, today: date) -> None:
@@ -384,6 +431,7 @@ def _goals_sheet(workbook: Workbook, session: Session, currency: str, today: dat
         progress_formula = f'=IF(C{row}=0,"",MIN(1,D{row}/C{row}))'
         _write_row(sheet, row, GOAL_SPEC, [
             goal.name, GOAL_TYPE_LABELS.get(goal.goal_type, goal.goal_type),
+            goal.currency,
             goal.target_amount, progress.current_amount, remaining_formula,
             progress_formula, goal.planned_monthly, progress.required_monthly,
             goal.target_date, progress.projected_completion,
@@ -391,7 +439,8 @@ def _goals_sheet(workbook: Workbook, session: Session, currency: str, today: dat
         ], currency)
         row += 1
     if row > first:
-        _total_row(sheet, row, GOAL_SPEC, first, currency)
+        _total_row(sheet, row, GOAL_SPEC, first, currency,
+                   currencies=_active(session))
 
 
 def _debts_sheet(workbook: Workbook, session: Session, currency: str, today: date) -> None:
@@ -405,6 +454,7 @@ def _debts_sheet(workbook: Workbook, session: Session, currency: str, today: dat
         _write_row(sheet, row, DEBT_SPEC, [
             view.debt.name,
             DEBT_TYPE_LABELS.get(view.debt.debt_type, view.debt.debt_type),
+            view.debt.currency,
             view.balance, f"{D(view.debt.interest_rate):.2f}%",
             view.debt.minimum_payment, view.debt.planned_payment,
             view.debt.extra_payment, view.monthly_interest,
@@ -416,7 +466,8 @@ def _debts_sheet(workbook: Workbook, session: Session, currency: str, today: dat
             sheet.cell(row=row, column=9, value="never at this payment").font = NOTE_FONT
         row += 1
     if row > first:
-        _total_row(sheet, row, DEBT_SPEC, first, currency)
+        _total_row(sheet, row, DEBT_SPEC, first, currency,
+                   currencies=_active(session))
 
 
 def _networth_sheet(workbook: Workbook, session: Session, currency: str,

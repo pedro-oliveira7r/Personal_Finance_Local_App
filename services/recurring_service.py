@@ -32,6 +32,7 @@ from constants import CategoryKind, Frequency, TxnKind, TxnStatus
 from database.models import Account, Category, RecurringRule, Transaction, utcnow
 from schemas.validation import RecurringRuleIn
 from services.common import (
+    with_default_currency,
     ConflictError,
     NotFoundError,
     ServiceError,
@@ -65,7 +66,7 @@ def get_rule(session: Session, rule_id: int) -> RecurringRule:
 
 
 def create_rule(session: Session, payload: dict[str, Any]) -> RecurringRule:
-    data = RecurringRuleIn(**payload)
+    data = RecurringRuleIn(**with_default_currency(session, payload))
     ensure_exists(session, Account, data.account_id, "Account")
     ensure_exists(session, Account, data.to_account_id, "Destination account")
     if data.category_id:
@@ -181,6 +182,20 @@ def _description_for(rule: RecurringRule, occurrence: Occurrence) -> str:
         return rule.name[:240]
 
 
+def _fx_legs(session: Session, rule: RecurringRule,
+             amount: Decimal) -> tuple[Optional[Decimal], Optional[Decimal]]:
+    """The far leg of a recurring transfer that crosses currencies.
+
+    This path builds its ``Transaction`` directly rather than going through
+    ``create_transfer``, so nothing downstream would catch a missing far leg.
+    """
+    if rule.kind != TxnKind.TRANSFER.value:
+        return None, None
+    from services.currency_service import legs_for_transfer
+
+    return legs_for_transfer(session, rule.account_id, rule.to_account_id, amount)
+
+
 def generate_for_rule(
     session: Session,
     rule: RecurringRule,
@@ -221,18 +236,22 @@ def generate_for_rule(
             if not refresh_existing:
                 report.unchanged += 1
                 continue
+            to_amount, fx_rate = _fx_legs(session, rule, occurrence.amount)
             changed = (
                 current.amount != occurrence.amount
                 or current.txn_date != occurrence.due_date
                 or current.actual_date is not None
+                or current.to_amount != to_amount
             )
             if changed:
                 current.amount = occurrence.amount
+                current.to_amount = to_amount
+                current.fx_rate = fx_rate
                 current.txn_date = occurrence.due_date
                 current.availability_date = _availability_override(rule, occurrence)
                 current.fingerprint = fingerprint(
                     occurrence.due_date, occurrence.amount, current.description,
-                    current.account_id, current.kind,
+                    current.account_id, current.kind, to_amount,
                 )
                 report.updated += 1
             else:
@@ -240,12 +259,15 @@ def generate_for_rule(
             continue
 
         description = _description_for(rule, occurrence)
+        to_amount, fx_rate = _fx_legs(session, rule, occurrence.amount)
         txn = Transaction(
             txn_date=occurrence.due_date,
             actual_date=None,
             availability_date=_availability_override(rule, occurrence),
             description=description,
             amount=occurrence.amount,
+            to_amount=to_amount,
+            fx_rate=fx_rate,
             kind=rule.kind,
             status=TxnStatus.PLANNED.value,
             category_id=rule.category_id,
@@ -261,7 +283,7 @@ def generate_for_rule(
             is_planned=True,
             fingerprint=fingerprint(
                 occurrence.due_date, occurrence.amount, description,
-                rule.account_id, rule.kind,
+                rule.account_id, rule.kind, to_amount,
             ),
         )
         session.add(txn)
@@ -367,15 +389,19 @@ class RuleProjection:
 
 
 def project_period(session: Session, period: Period, *,
-                   only_budget_rules: bool = True) -> RuleProjection:
+                   only_budget_rules: bool = True,
+                   currency: Optional[str] = None) -> RuleProjection:
     """What the active rules imply for one period, by category."""
     kinds = {
         row[0]: row[1]
         for row in session.execute(select(Category.id, Category.kind)).all()
     }
+    code = currency.upper() if currency else None
     projection = RuleProjection()
     for rule in list_rules(session, active_only=True):
         if only_budget_rules and not rule.include_in_budget:
+            continue
+        if code is not None and (rule.currency or "").upper() != code:
             continue
         total = money_sum(
             occ.amount for occ in occurrences_in_period(spec_from_rule(rule), period)

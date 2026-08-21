@@ -1,31 +1,49 @@
-"""Forecast — where the money is heading, and what-if scenarios."""
+"""Forecast — where the money is heading."""
 
 from __future__ import annotations
 
 from datetime import date
-from decimal import Decimal
 
 import streamlit as st
 
-from calculations.money import ZERO, D, money, money_sum
+from calculations.money import ZERO, money
 from charts import dashboard_charts as dc
 from charts import financial_charts as fc
 from services import forecast_service, networth_service, reporting_service
+from services.common import ServiceError
 from ui import components as ui
 
 
 def render() -> None:
-    fmt = ui.formatter()
     settings = ui.current_settings()
-    theme = ui.theme()
     today = date.today()
 
     ui.page_header(
         "Forecast",
-        "A projection, clearly separated from what actually happened. Each period says "
-        "where its numbers came from.",
+        "A projection, clearly separated from what actually happened.",
         icon="🔮",
     )
+
+    book = ui.currency_book()
+    # Forecast is the one screen that opens combined: a projection of "how much
+    # money will I have" is the question least served by looking at one
+    # currency at a time.
+    currency = ui.currency_picker(key="fc_currency", default=ui.ALL_CURRENCIES)
+
+    if currency is None:
+        missing = [c for c in book.active if not book.has_rate(c)]
+        if missing:
+            st.error(
+                f"No exchange rate on file for {', '.join(missing)}. Set one on the "
+                "Dashboard, or pick a single currency to project it on its own.",
+                icon="💱",
+            )
+            return
+        ui.converted_notice(book)
+
+    display = currency or book.primary
+    fmt = ui.formatter(display)
+    theme = ui.theme(display)
 
     columns = st.columns([0.24, 0.24, 0.26, 0.26])
     with columns[0]:
@@ -41,14 +59,20 @@ def render() -> None:
                                         "back to an average of this many recent months.")
     with columns[3]:
         comfort = ui.money_input("Low-cash warning level", ZERO, key="fc_comfort",
+                                 currency=display,
                                  help_text="Warn when projected cash dips below this.")
 
     with ui.db_read() as session:
-        bundle = forecast_service.build(
-            session, months=months, history_months=history_months,
-            average_window=average_window, today=today,
-            low_cash_threshold=comfort,
-        )
+        options = dict(months=months, history_months=history_months,
+                       average_window=average_window, today=today,
+                       low_cash_threshold=comfort)
+        try:
+            bundle = (forecast_service.build_combined(session, book=book, **options)
+                      if currency is None
+                      else forecast_service.build(session, currency=currency, **options))
+        except ServiceError as exc:
+            st.error(str(exc), icon="💱")
+            return
 
     if not bundle.rows:
         ui.empty_state(
@@ -60,16 +84,14 @@ def render() -> None:
         return
 
     _headline(bundle, fmt, months)
+    if bundle.converted:
+        _per_currency_breakdown(bundle, book)
     ui.divider()
 
-    tabs = st.tabs(["Cash projection", "Components", "What if…", "Net worth outlook"])
+    tabs = st.tabs(["Cash projection", "Net worth outlook"])
     with tabs[0]:
         _cash_tab(bundle, theme, fmt)
     with tabs[1]:
-        _components_tab(bundle, theme, fmt)
-    with tabs[2]:
-        _scenario_tab(bundle, theme, fmt, today, comfort)
-    with tabs[3]:
         _net_worth_tab(theme, fmt, today)
 
 
@@ -134,132 +156,6 @@ def _cash_tab(bundle, theme, fmt: ui.Formatter) -> None:
         st.metric("Periods before cash runs out",
                   "never at this rate" if runway is None else str(runway))
 
-    ui.divider()
-    ui.section("Period by period")
-    ui.money_table(
-        [{"period": row.period.label,
-          "state": "Actual" if row.is_actual else "Forecast",
-          "basis": row.source_label,
-          "income": row.assumption.income,
-          "expenses": row.assumption.expenses,
-          "savings": money(row.assumption.savings_reserved
-                           + row.assumption.savings_outflow),
-          "investments": row.assumption.investments,
-          "debt": row.assumption.debt_payments,
-          "net": row.net_flow,
-          "closing": row.closing_cash,
-          "free": row.free_cash}
-         for row in bundle.rows],
-        [("period", "Period", "text"), ("state", "", "text"),
-         ("basis", "Based on", "text"), ("income", "Income", "money"),
-         ("expenses", "Expenses", "money"), ("savings", "Savings", "money"),
-         ("investments", "Investments", "money"), ("debt", "Debt", "money"),
-         ("net", "Net flow", "money"), ("closing", "Closing cash", "money"),
-         ("free", "Free cash", "money")],
-        fmt, height=min(620, 60 + 36 * len(bundle.rows)),
-    )
-
-
-def _components_tab(bundle, theme, fmt: ui.Formatter) -> None:
-    ui.section("What the projection is made of")
-    ui.chart(fc.forecast_components_bars(bundle.future_rows or bundle.rows, theme,
-                                        height=380),
-             key="fc_components")
-    st.caption(
-        "Savings that stay inside a cash account are not shown as outflow — that money "
-        "is earmarked, not spent, so it never leaves the cash pool."
-    )
-
-    sources: dict[str, int] = {}
-    for row in bundle.rows:
-        sources[row.source_label] = sources.get(row.source_label, 0) + 1
-    ui.divider()
-    ui.section("Where each period's numbers come from")
-    for label, count in sources.items():
-        st.markdown(f"- **{label}** — {count} period(s)")
-    if bundle.average is not None:
-        st.caption(
-            f"Average fallback: income {fmt.md_money(bundle.average.income)}, expenses "
-            f"{fmt.md_money(bundle.average.expenses)} — {ui.md(bundle.average.note)}."
-        )
-    st.info(
-        "Priority order per period: an explicit budget wins, then your recurring rules, "
-        "then an average of recent history. Write a budget for a month and the forecast "
-        "immediately trusts it instead.",
-        icon="ℹ️",
-    )
-
-
-def _scenario_tab(bundle, theme, fmt: ui.Formatter, today: date,
-                  comfort: Decimal) -> None:
-    ui.section(
-        "What if…",
-        "Adjust the assumptions and see the projection move. Nothing is saved — this is "
-        "a sandbox.",
-    )
-    columns = st.columns([0.25, 0.25, 0.25, 0.25])
-    with columns[0]:
-        income_pct = ui.pct_input("Income changes by", ZERO, key="sc_income",
-                                  min_value=-90.0, max_value=200.0)
-    with columns[1]:
-        expense_pct = ui.pct_input("Expenses change by", ZERO, key="sc_expense",
-                                    min_value=-90.0, max_value=200.0)
-    with columns[2]:
-        one_off_amount = ui.money_input("One-off expense", ZERO, key="sc_oneoff")
-    with columns[3]:
-        future = bundle.future_rows
-        options = [row.period.key for row in future]
-        one_off_period = st.selectbox(
-            "…in which period", options,
-            format_func=lambda item: next(
-                (row.period.label for row in future if row.period.key == item), item),
-            key="sc_period", disabled=not options,
-        ) if options else None
-
-    if income_pct == 0 and expense_pct == 0 and one_off_amount == 0:
-        st.info("Change one of the levers above to see a scenario.", icon="🎚️")
-        return
-
-    one_off = ({one_off_period: one_off_amount}
-               if one_off_amount > 0 and one_off_period else None)
-    scenario = forecast_service.run_scenario(
-        bundle, income_pct=income_pct, expense_pct=expense_pct,
-        one_off=one_off, today=today, low_cash_threshold=comfort,
-    )
-
-    base_future = bundle.future_rows
-    scenario_future = scenario.future_rows
-    base_end = base_future[-1].closing_cash if base_future else ZERO
-    scenario_end = scenario_future[-1].closing_cash if scenario_future else ZERO
-    difference = money(scenario_end - base_end)
-
-    ui.kpi_row([
-        ui.Kpi("Baseline ending cash", fmt.money(base_end), icon="📊"),
-        ui.Kpi("Scenario ending cash", fmt.money(scenario_end), icon="🎚️",
-               delta=fmt.signed_money(difference), delta_good=difference >= 0),
-        ui.Kpi("Scenario net flow",
-               fmt.signed_money(scenario.totals.get("net_flow", ZERO)), icon="🔄"),
-        ui.Kpi("First problem period",
-               scenario.first_negative.period.label if scenario.first_negative
-               else "none", icon="⚠️"),
-    ], columns=4)
-
-    ui.chart(
-        fc.scenario_comparison_line(base_future, scenario_future, theme, height=380,
-                                    scenario_name="Scenario"),
-        table=[{"Period": row.label,
-                "Scenario income": fmt.money(row.assumption.income),
-                "Scenario expenses": fmt.money(row.assumption.expenses),
-                "Scenario closing cash": fmt.money(row.closing_cash)}
-               for row in scenario_future],
-        key="fc_scenario",
-    )
-
-    for alert in scenario.alerts:
-        icon = {"critical": "🔴", "warning": "🟠"}.get(alert.severity, "🔵")
-        (st.error if alert.severity == "critical" else st.warning)(
-            f"{icon} {alert.message}")
-
 
 def _net_worth_tab(theme, fmt: ui.Formatter, today: date) -> None:
     ui.section("Net worth outlook",
@@ -309,3 +205,34 @@ def _net_worth_tab(theme, fmt: ui.Formatter, today: date) -> None:
                   delta_color="normal" if growth >= 0 else "inverse")
     st.caption("A straight-line projection, not a market prediction. It assumes today's "
                "habits continue unchanged.")
+
+
+def _per_currency_breakdown(bundle, book) -> None:
+    """Each currency's own closing cash, unconverted.
+
+    A converted headline is only trustworthy if you can see what it was made
+    of — this is the cheapest way to let someone check the arithmetic, and to
+    notice a rate that has drifted out of date.
+    """
+    if not bundle.parts:
+        return
+    with st.expander("Show the per-currency breakdown"):
+        rows = []
+        for code, part in bundle.parts.items():
+            ending = part.future_rows[-1] if part.future_rows else None
+            rows.append({
+                "currency": f"{book.symbol(code)} {code}",
+                "start": ui.formatter(code).money(part.start_cash),
+                "end": ui.formatter(code).money(
+                    ending.closing_cash if ending else ZERO),
+                "rate": ("—" if code == book.primary
+                         else ui.formatter(book.primary).money(
+                             book.rate_to_primary(code))),
+            })
+        st.dataframe(
+            [{"Currency": r["currency"], "Cash now": r["start"],
+              "Projected": r["end"], f"1 unit = ({book.primary})": r["rate"]}
+             for r in rows],
+            hide_index=True, **ui.wide(),
+        )
+        st.caption("These are each currency's own figures, with nothing converted.")

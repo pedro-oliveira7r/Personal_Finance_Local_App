@@ -35,6 +35,10 @@ SOURCE_RULES = "rules"
 SOURCE_AVERAGE = "average"
 SOURCE_ACTUAL = "actual"
 SOURCE_MANUAL = "manual"
+#: Folding several currencies into one period usually draws on different
+#: sources per currency — a budget for one, rules for another. Saying "from
+#: your budget" then would be a quiet lie.
+SOURCE_MIXED = "mixed"
 
 SOURCE_LABELS = {
     SOURCE_BUDGET: "From your budget",
@@ -42,6 +46,7 @@ SOURCE_LABELS = {
     SOURCE_AVERAGE: "From recent averages",
     SOURCE_ACTUAL: "Actual (recorded)",
     SOURCE_MANUAL: "Manual assumption",
+    SOURCE_MIXED: "Mixed sources across currencies",
 }
 
 
@@ -74,22 +79,6 @@ class ForecastAssumption:
     def total_allocated(self) -> Decimal:
         """Everything the budget promised, cash-leaving or not."""
         return money(self.total_outflow + self.savings_reserved)
-
-    def scaled(self, income_pct: Decimal = ZERO, expense_pct: Decimal = ZERO) -> "ForecastAssumption":
-        """Copy with income/expenses shifted by a percentage (scenario tool)."""
-        income_factor = Decimal(1) + D(income_pct) / Decimal(100)
-        expense_factor = Decimal(1) + D(expense_pct) / Decimal(100)
-        return ForecastAssumption(
-            period_key=self.period_key,
-            income=money(self.income * income_factor),
-            expenses=money(self.expenses * expense_factor),
-            savings_reserved=self.savings_reserved,
-            savings_outflow=self.savings_outflow,
-            investments=self.investments,
-            debt_payments=self.debt_payments,
-            source=self.source,
-            note=self.note,
-        )
 
 
 @dataclass
@@ -239,38 +228,6 @@ def average_assumption(
         debt_payments=mean("debt_payments"),
         source=SOURCE_AVERAGE,
         note=f"Average of the last {len(window)} period(s)",
-    )
-
-
-def scenario(
-    rows: Sequence[ForecastRow],
-    *,
-    income_pct: Decimal = ZERO,
-    expense_pct: Decimal = ZERO,
-    one_off: Optional[Mapping[str, Decimal]] = None,
-    opening_cash: Optional[Decimal] = None,
-    opening_reserved: Decimal = ZERO,
-    today: Optional[date] = None,
-) -> list[ForecastRow]:
-    """Re-run a forecast with income/expenses nudged and one-offs injected.
-
-    ``one_off`` maps a period key to an extra expense in that period, for
-    "what if I buy a car in March" style questions.
-    """
-    if not rows:
-        return []
-    periods = [row.period for row in rows]
-    start_cash = rows[0].opening_cash if opening_cash is None else money(opening_cash)
-    adjusted: dict[str, ForecastAssumption] = {}
-    for row in rows:
-        assumption = row.assumption.scaled(income_pct, expense_pct)
-        if one_off and row.period.key in one_off:
-            assumption.expenses = money(assumption.expenses + D(one_off[row.period.key]))
-            assumption.note = (assumption.note + " · one-off included").strip(" ·")
-        adjusted[row.period.key] = assumption
-    return build_forecast(
-        periods, start_cash, adjusted,
-        opening_reserved=opening_reserved, today=today,
     )
 
 

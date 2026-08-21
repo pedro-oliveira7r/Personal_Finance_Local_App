@@ -21,6 +21,7 @@ from services import (
     settings_service,
 )
 from services import transaction_service as txs
+from database.models import Account
 from services.common import ConflictError
 
 
@@ -165,14 +166,6 @@ def test_upserting_the_same_category_twice_updates_rather_than_duplicating(
                      if item.category_id == categories["groceries"].id]
     assert len(grocery_lines) == 1
     assert grocery_lines[0].planned_amount == Decimal("600.00")
-
-
-def test_generating_a_range_covers_every_period(session, rules):
-    start = make_period(2026, 1)
-    reports = budget_service.generate_range(session, start, 12)
-    session.commit()
-    assert len(reports) == 12
-    assert len(budget_service.period_keys_with_budget(session)) == 12
 
 
 def test_copying_a_period_with_growth(session, rules):
@@ -620,7 +613,11 @@ def test_excel_workbook_has_every_sheet(session, accounts, categories, rules):
 
     sheet = workbook["Transactions"]
     assert sheet["A1"].value == "Date"
-    formulas = [cell.value for cell in sheet["I"] if isinstance(cell.value, str)
+    # Locate the money column by its header rather than by letter: the columns
+    # shift whenever a new one (Currency, say) is inserted before it.
+    headers = {cell.value: cell.column_letter for cell in sheet[1]}
+    amount_col = headers["Amount"]
+    formulas = [cell.value for cell in sheet[amount_col] if isinstance(cell.value, str)
                 and str(cell.value).startswith("=")]
     assert formulas, "the total row should be a live SUM formula"
 
@@ -788,6 +785,34 @@ def test_demo_data_is_coherent(session):
     assert len(category_service.list_categories(session)) > 0
 
 
+def test_clearing_data_leaves_no_money_behind(session):
+    """Clearing must zero the kept accounts, not just empty their history.
+
+    The demo accounts open with 3200 + 6500 + 250 in cash. Deleting only the
+    transactions left those opening balances standing, so a freshly cleared
+    book still reported 9950 in cash with nothing on screen to explain it.
+    """
+    from demo.demo_data import clear_all_data, load_demo_data
+
+    load_demo_data(session, months_back=6, months_forward=2,
+                   today=date(2026, 8, 17))
+    session.commit()
+    before = account_service.totals(account_service.balance_views(session))
+    assert before.cash > 0
+
+    clear_all_data(session, keep_accounts=True, keep_categories=True)
+    session.commit()
+
+    after = account_service.totals(account_service.balance_views(session))
+    assert after.cash == Decimal("0")
+    assert after.net_worth == Decimal("0")
+    assert after.liabilities == Decimal("0")
+    # the accounts themselves survive, so the user keeps their setup
+    accounts = session.execute(select(Account)).scalars().all()
+    assert accounts
+    assert all(a.opening_balance == Decimal("0") for a in accounts)
+
+
 def test_demo_data_can_be_loaded_twice_without_duplicating(session):
     from demo.demo_data import load_demo_data
 
@@ -825,52 +850,12 @@ def test_history_and_averages_agree(session, accounts, categories):
     assert averages["expenses"] == Decimal("1500.00")  # June and July only
 
 
-def test_month_over_month_reports_the_change(session, accounts, categories):
-    for month, amount in ((7, "1000"), (8, "1500")):
-        txs.create_transaction(session, {
-            "txn_date": date(2026, month, 10), "description": f"Spend {month}",
-            "amount": amount, "kind": TxnKind.EXPENSE.value,
-            "account_id": accounts["Checking"].id,
-            "category_id": categories["groceries"].id,
-        })
-    session.commit()
-    comparison = reporting_service.month_over_month(
-        session, make_period(2026, 8), date(2026, 8, 17))
-    expenses = comparison["metrics"]["expenses"]
-    assert expenses["previous"] == Decimal("1000.00")
-    assert expenses["current"] == Decimal("1500.00")
-    assert expenses["change"] == Decimal("500.00")
-    assert expenses["change_pct"] == Decimal("50.00")
-
-
 def test_dashboard_survives_an_empty_database(session):
     snapshot = reporting_service.dashboard(session, today=date(2026, 8, 17))
     assert snapshot.cash == Decimal("0.00")
     assert snapshot.net_worth == Decimal("0.00")
     assert not snapshot.has_data
     assert isinstance(snapshot.alerts, list)
-
-
-def test_recurring_patterns_need_repetition(session, accounts, categories):
-    for month in (3, 4, 5, 6, 7):
-        txs.create_transaction(session, {
-            "txn_date": date(2026, month, 10), "description": f"Food {month}",
-            "amount": "500", "kind": TxnKind.EXPENSE.value,
-            "account_id": accounts["Checking"].id,
-            "category_id": categories["groceries"].id,
-        })
-    txs.create_transaction(session, {
-        "txn_date": date(2026, 7, 20), "description": "One-off",
-        "amount": "900", "kind": TxnKind.EXPENSE.value,
-        "account_id": accounts["Checking"].id,
-        "category_id": categories["rent"].id,
-    })
-    session.commit()
-
-    patterns = reporting_service.recurring_patterns(session, 5, date(2026, 8, 17))
-    labels = {row["label"] for row in patterns}
-    assert any("Groceries" in label for label in labels)
-    assert not any("Rent" in label for label in labels)
 
 
 # --------------------------------------------------------------------------

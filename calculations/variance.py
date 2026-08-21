@@ -231,17 +231,6 @@ class VarianceSummary:
     unbudgeted_count: int = 0
     rows: list[VarianceRow] = field(default_factory=list)
 
-    @property
-    def accuracy_pct(self) -> Decimal:
-        """How close the plan was, as ``100 − |variance| / planned``.
-
-        100% means the plan matched reality exactly; it never goes below 0.
-        """
-        if self.planned == 0:
-            return ZERO
-        raw = Decimal("100") - pct_of(abs(self.variance), self.planned)
-        return raw if raw > 0 else ZERO
-
 
 def summarise(rows: Sequence[VarianceRow]) -> VarianceSummary:
     summary = VarianceSummary(rows=list(rows))
@@ -290,14 +279,3 @@ def approaching_limit(
         key=lambda r: r.consumed_pct,
         reverse=True,
     )
-
-
-def pace_projection(row: VarianceRow, elapsed_fraction: float) -> Decimal:
-    """Extrapolate a category's spend to the end of the period.
-
-    ``elapsed_fraction`` is 0-1 from :meth:`Period.elapsed_fraction`. Used for
-    "at this rate you will finish the month at X" messages.
-    """
-    if elapsed_fraction <= 0:
-        return row.actual
-    return money(row.actual / D(str(elapsed_fraction)))

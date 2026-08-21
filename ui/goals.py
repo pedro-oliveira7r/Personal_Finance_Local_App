@@ -19,7 +19,6 @@ from constants import (
     DebtType,
     GoalStatus,
     GoalType,
-    PayoffStrategy,
 )
 from services import account_service, category_service, debt_service, goal_service
 from ui import components as ui
@@ -31,27 +30,29 @@ def render() -> None:
         "What you are saving toward, and what you are paying off.",
         icon="🚩",
     )
-    tabs = st.tabs(["Goals", "Debts", "Payoff strategies"])
+    tabs = st.tabs(["Goals", "Debts"])
     with tabs[0]:
         _goals()
     with tabs[1]:
         _debts()
-    with tabs[2]:
-        _strategies()
 
 
 # ==========================================================================
 # Goals
 # ==========================================================================
 def _goals() -> None:
-    fmt = ui.formatter()
+    # Per-currency only: a target converted at today's rate is not the number
+    # you are actually saving toward.
+    currency = ui.currency_picker(key="goals_currency", include_all=False)
+    fmt = ui.formatter(currency)
     theme = ui.theme()
     today = date.today()
 
     with ui.db_read() as session:
-        progresses = goal_service.all_progress(session, today=today)
+        progresses = goal_service.all_progress(session, today=today,
+                                               currency=currency)
         all_goals = goal_service.list_goals(session)
-        totals = goal_service.totals(session, today=today)
+        totals = goal_service.totals(session, today=today, currency=currency)
         accounts = account_service.options_for_select(session)
         savings_cats = category_service.options_for_select(
             session, kinds=[CategoryKind.SAVINGS.value,
@@ -105,7 +106,7 @@ def _goals() -> None:
     ui.divider()
     _contribute(progresses, accounts, fmt)
     ui.divider()
-    _distribute(fmt)
+    _distribute(fmt, currency)
     ui.divider()
     _goal_projection(progresses, fmt)
     ui.divider()
@@ -145,17 +146,19 @@ def _contribute(progresses, accounts, fmt: ui.Formatter) -> None:
             )
 
 
-def _distribute(fmt: ui.Formatter) -> None:
+def _distribute(fmt: ui.Formatter, currency: str | None = None) -> None:
     ui.section("Split spare money across goals",
                "Ranked by urgency: the goal with the nearest deadline and the largest "
                "monthly requirement gets funded first.")
     columns = st.columns([0.3, 0.7])
     with columns[0]:
-        available = ui.money_input("Amount to split", ZERO, key="dist_amount")
+        available = ui.money_input("Amount to split", ZERO, key="dist_amount",
+                                   currency=currency)
     if available <= 0:
         return
     with ui.db_read() as session:
-        plan = goal_service.suggest_distribution(session, available)
+        plan = goal_service.suggest_distribution(session, available,
+                                                 currency=currency)
     if not plan:
         st.caption("No goals still need funding.")
         return
@@ -357,15 +360,17 @@ def _edit_goal(goals, accounts, savings_cats, fmt: ui.Formatter) -> None:
 # Debts
 # ==========================================================================
 def _debts() -> None:
-    fmt = ui.formatter()
+    currency = ui.currency_picker(key="debts_currency", include_all=False)
+    fmt = ui.formatter(currency)
     theme = ui.theme()
     settings = ui.current_settings()
     today = date.today()
     period = settings.current_period(today)
 
     with ui.db_read() as session:
-        views = debt_service.views(session, period=period, today=today)
-        totals = debt_service.totals(session)
+        views = debt_service.views(session, period=period, today=today,
+                                   currency=currency)
+        totals = debt_service.totals(session, currency=currency)
         alerts = debt_service.alerts(session)
         accounts = account_service.options_for_select(session)
         debt_cats = category_service.options_for_select(
@@ -700,113 +705,3 @@ def _edit_debt(views, accounts, debt_cats, fmt: ui.Formatter) -> None:
                                                              force=True),
                     success=f"“{debt.name}” deleted.",
                 )
-
-
-# ==========================================================================
-# Strategies
-# ==========================================================================
-def _strategies() -> None:
-    fmt = ui.formatter()
-    theme = ui.theme()
-    today = date.today()
-
-    ui.section(
-        "Which payoff order costs least?",
-        "**Avalanche** attacks the highest interest rate first and always costs the "
-        "least. **Snowball** clears the smallest balance first, which is slower but "
-        "gives you a win sooner. Both keep paying every minimum, and the extra below "
-        "rolls down the queue — growing as each debt clears and frees its minimum. "
-        "**Minimums only** is the do-nothing baseline: no extra, nothing rolled, so "
-        "you can see what changing nothing costs.",
-    )
-    columns = st.columns([0.3, 0.7])
-    with columns[0]:
-        extra = ui.money_input("Extra to share each month", ZERO, key="strat_extra")
-
-    with ui.db_read() as session:
-        debts = debt_service.list_debts(session)
-        results = debt_service.compare_strategies(session, extra, today)
-
-    if not debts:
-        st.info("Add at least one debt to compare strategies.", icon="ℹ️")
-        return
-
-    # Name the blocker rather than just reporting that nothing works. Only the
-    # strategies you could actually follow count as a problem; the minimums-only
-    # baseline stalling is the point of showing it, not a fault.
-    actionable = [results[key] for key in
-                  (PayoffStrategy.AVALANCHE.value, PayoffStrategy.SNOWBALL.value)
-                  if key in results]
-    blocked = sorted({name for result in actionable for name in result.stuck})
-    minimum_only = results.get(PayoffStrategy.MINIMUM_ONLY.value)
-
-    if blocked:
-        with ui.db_read() as session:
-            views = {view.debt.name: view for view in debt_service.views(session,
-                                                                        today=today)}
-        lines = []
-        for name in blocked:
-            view = views.get(name)
-            if view is None:
-                continue
-            payment = money((view.debt.planned_payment or view.debt.minimum_payment)
-                            + (view.debt.extra_payment or ZERO))
-            lines.append(
-                f"- **{name}** — paying {fmt.money(payment)} a month against "
-                f"{fmt.money(view.monthly_interest)} of monthly interest"
-            )
-        st.error(
-            "🔴 **These debts grow faster than you are paying them.** The balance rises "
-            "every month no matter which order you choose, so no strategy can clear "
-            "them:\n\n" + "\n".join(lines) +
-            "\n\nRaise the planned payment above the interest figure, or add enough "
-            "extra below to cover the gap — the comparison becomes meaningful as soon "
-            "as the balance starts falling.",
-        )
-    elif minimum_only is not None and minimum_only.stuck:
-        st.warning(
-            "🟠 Paying only the minimum on **" +
-            "**, **".join(minimum_only.stuck) +
-            "** would never clear it — the minimum does not even cover the monthly "
-            "interest. Your planned payments do, which is exactly why the two rows "
-            "below differ so much.",
-        )
-
-    ui.chart(fc.strategy_comparison_bars(results, theme, height=300),
-             key="strat_chart")
-
-    names = {"avalanche": "Avalanche (highest rate first)",
-             "snowball": "Snowball (smallest balance first)",
-             "minimum_only": "Minimums only"}
-    rows = []
-    for key, result in results.items():
-        rows.append({
-            "strategy": names.get(key, key),
-            "months": result.months if not result.never_pays_off else None,
-            "interest": result.total_interest if not result.never_pays_off else None,
-            "paid": result.total_paid if not result.never_pays_off else None,
-            "outlay": result.monthly_outlay,
-            "order": " → ".join(result.payoff_order) if result.payoff_order else "—",
-            "note": (f"never clears — {', '.join(result.stuck)} outgrows its payment"
-                     if result.stuck else
-                     ("never clears within 50 years" if result.never_pays_off else "")),
-        })
-    ui.money_table(
-        rows,
-        [("strategy", "Strategy", "text"), ("months", "Months", "int"),
-         ("interest", "Total interest", "money"), ("paid", "Total paid", "money"),
-         ("outlay", "Monthly outlay", "money"), ("order", "Clears in this order", "text"),
-         ("note", "", "text")],
-        fmt,
-    )
-
-    usable = {k: v for k, v in results.items() if not v.never_pays_off and v.months}
-    if len(usable) >= 2:
-        best = min(usable.items(), key=lambda item: item[1].total_interest)
-        worst = max(usable.items(), key=lambda item: item[1].total_interest)
-        if best[0] != worst[0]:
-            st.success(
-                f"✅ **{names.get(best[0], best[0])}** saves "
-                f"{fmt.money(money(worst[1].total_interest - best[1].total_interest))} "
-                f"in interest compared with {names.get(worst[0], worst[0])}.",
-            )

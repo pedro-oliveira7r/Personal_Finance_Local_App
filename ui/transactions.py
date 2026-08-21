@@ -17,6 +17,7 @@ from constants import (
 )
 from services import account_service, category_service, debt_service, goal_service
 from services import transaction_service as txs
+from services import common
 from ui import components as ui
 
 PAGE_SIZE = 50
@@ -51,6 +52,7 @@ def _browse() -> None:
     fmt = ui.formatter()
     settings = ui.current_settings()
     today = date.today()
+    currency = ui.currency_picker(key="txn_currency")
 
     with ui.db_read() as session:
         accounts = account_service.options_for_select(session, include_archived=True)
@@ -134,6 +136,7 @@ def _browse() -> None:
         planned_flag=(True if planned_flag == "Was planned"
                       else (False if planned_flag == "Unplanned" else None)),
         use_effective_date=use_effective,
+        currency=currency,
     )
 
     page = st.session_state.get("_txn_page", 0)
@@ -146,16 +149,33 @@ def _browse() -> None:
                                                             include_archived=True)
         name_map = dict(category_names)
         account_map = dict(accounts)
+        currency_map = common.account_currency_map(session)
 
-    totals_in = money_sum(t.amount for t in rows if t.kind == TxnKind.INCOME.value)
-    totals_out = money_sum(t.amount for t in rows if t.kind == TxnKind.EXPENSE.value)
-    ui.kpi_row([
-        ui.Kpi("Matching transactions", f"{total:,}".replace(",", "."), icon="🔢"),
-        ui.Kpi("Income on this page", fmt.money(totals_in), icon="📥"),
-        ui.Kpi("Expenses on this page", fmt.money(totals_out), icon="📤"),
-        ui.Kpi("Net on this page", fmt.signed_money(money(totals_in - totals_out)),
-               icon="🔄"),
-    ], columns=4)
+    # Adding a page of mixed-currency rows would produce a confident, wrong
+    # number. With no filter on a multi-currency book, only the count is honest.
+    mixed = currency is None and len({
+        currency_map.get(t.account_id) for t in rows
+        if t.account_id is not None
+    }) > 1
+    if mixed:
+        ui.kpi_row([
+            ui.Kpi("Matching transactions", f"{total:,}".replace(",", "."), icon="🔢"),
+        ], columns=4)
+        st.caption("Pick a single currency above to total these rows — amounts in "
+                   "different currencies cannot be added together.")
+    else:
+        code = currency or next(
+            (currency_map.get(t.account_id) for t in rows if t.account_id), None)
+        page_fmt = fmt.for_currency(code)
+        totals_in = money_sum(t.amount for t in rows if t.kind == TxnKind.INCOME.value)
+        totals_out = money_sum(t.amount for t in rows if t.kind == TxnKind.EXPENSE.value)
+        ui.kpi_row([
+            ui.Kpi("Matching transactions", f"{total:,}".replace(",", "."), icon="🔢"),
+            ui.Kpi("Income on this page", page_fmt.money(totals_in), icon="📥"),
+            ui.Kpi("Expenses on this page", page_fmt.money(totals_out), icon="📤"),
+            ui.Kpi("Net on this page",
+                   page_fmt.signed_money(money(totals_in - totals_out)), icon="🔄"),
+        ], columns=4)
 
     if not rows:
         ui.empty_state(
@@ -178,7 +198,12 @@ def _browse() -> None:
             "Type": f"{kind_icon.get(txn.kind, '')} {txn.kind.title()}",
             "Category": name_map.get(txn.category_id, "—") if txn.category_id else "—",
             "Account": account_map.get(txn.account_id, "—") if txn.account_id else "—",
-            "Amount": fmt.money(txn.amount),
+            "Amount": (
+                f"{fmt.money(txn.amount, currency=currency_map.get(txn.account_id))}"
+                f" → {fmt.money(txn.to_amount, currency=currency_map.get(txn.to_account_id))}"
+                if txn.is_fx else
+                fmt.money(txn.amount, currency=currency_map.get(txn.account_id))
+            ),
             "Tags": txn.tags or "",
         }
         for txn in rows
@@ -517,6 +542,7 @@ def _transfer_form() -> None:
     )
     with ui.db_read() as session:
         accounts = account_service.options_for_select(session)
+        currencies = common.account_currency_map(session)
         goals = [(g.id, g.name) for g in goal_service.active_goals(session)]
         debts = [(d.id, d.name) for d in debt_service.list_debts(session)]
 
@@ -524,19 +550,56 @@ def _transfer_form() -> None:
         st.info("You need at least two accounts to make a transfer.", icon="ℹ️")
         return
 
+    labels = dict(accounts)
+
+    def label_for(item: int) -> str:
+        code = currencies.get(item)
+        return f"{labels[item]} · {code}" if code else labels[item]
+
+    # The account pickers sit OUTSIDE the form on purpose. Widgets inside a
+    # Streamlit form do not rerun until submit, so the form could not know
+    # whether the two accounts differ in currency — and therefore could not
+    # ask for the second amount before it was too late to matter.
+    columns = st.columns(2)
+    with columns[0]:
+        from_id = st.selectbox("From", [item[0] for item in accounts],
+                               format_func=label_for, key="transfer_from")
+    with columns[1]:
+        to_id = st.selectbox("To", [item[0] for item in accounts],
+                             index=min(1, len(accounts) - 1),
+                             format_func=label_for, key="transfer_to")
+
+    from_code = currencies.get(from_id)
+    to_code = currencies.get(to_id)
+    crosses = bool(from_code and to_code and from_code != to_code)
+
     with st.form("add_transfer", clear_on_submit=True):
-        columns = st.columns([0.28, 0.28, 0.22, 0.22])
-        with columns[0]:
-            from_id = st.selectbox("From", [item[0] for item in accounts],
-                                   format_func=lambda item: dict(accounts)[item])
-        with columns[1]:
-            to_id = st.selectbox("To", [item[0] for item in accounts],
-                                 index=min(1, len(accounts) - 1),
-                                 format_func=lambda item: dict(accounts)[item])
-        with columns[2]:
-            amount = ui.money_input("Amount", ZERO, key="transfer_amount")
-        with columns[3]:
-            txn_date = st.date_input("Date", value=date.today())
+        if crosses:
+            columns = st.columns([0.28, 0.28, 0.22, 0.22])
+            with columns[0]:
+                amount = ui.money_input(f"Amount sent ({from_code})", ZERO,
+                                        key="transfer_amount", currency=from_code)
+            with columns[1]:
+                received = ui.money_input(f"Amount received ({to_code})", ZERO,
+                                          key="transfer_received", currency=to_code)
+            with columns[2]:
+                txn_date = st.date_input("Date", value=date.today())
+            with columns[3]:
+                st.caption(
+                    "Enter both amounts exactly as your statements show them. "
+                    "The rate is worked out from the two and recorded on the "
+                    "transfer, so any spread your bank took is captured."
+                )
+        else:
+            received = None
+            columns = st.columns([0.34, 0.33, 0.33])
+            with columns[0]:
+                amount = ui.money_input("Amount", ZERO, key="transfer_amount",
+                                        currency=from_code)
+            with columns[1]:
+                txn_date = st.date_input("Date", value=date.today())
+            with columns[2]:
+                st.caption("Both accounts hold the same currency.")
 
         columns = st.columns([0.4, 0.3, 0.3])
         with columns[0]:
@@ -556,17 +619,21 @@ def _transfer_form() -> None:
                 st.error("Pick two different accounts.")
             elif amount <= 0:
                 st.error("The amount has to be greater than zero.")
+            elif crosses and (received is None or received <= 0):
+                st.error(f"Enter how much actually arrived in {to_code}.")
             else:
                 payload = {
                     "txn_date": txn_date, "description": description or "Transfer",
-                    "amount": amount, "kind": TxnKind.TRANSFER.value,
+                    "amount": amount,
+                    "to_amount": received if crosses else None,
                     "status": TxnStatus.COMPLETED.value, "actual_date": txn_date,
-                    "account_id": from_id, "to_account_id": to_id,
+                    "from_account_id": from_id, "to_account_id": to_id,
                     "notes": notes or None, "goal_id": goal_id, "debt_id": debt_id,
                 }
+                sent_text = ui.formatter(from_code).money(amount)
                 ui.run_action(
-                    lambda session: txs.create_transaction(session, payload),
-                    success=f"Transferred {money(amount)}.",
+                    lambda session: txs.create_transfer(session, payload),
+                    success=f"Transferred {sent_text}.",
                 )
 
 

@@ -99,6 +99,23 @@ class CategoryIn(BaseIn, MoneyMixin):
         return text
 
 
+class CurrencyMixin:
+    """A ``currency`` field plus the one rule every code must satisfy.
+
+    Membership in ``SUPPORTED_CURRENCIES`` is *not* checked here: an unknown
+    code still formats (``format_money`` falls back to the code as its own
+    symbol), and rejecting one at this layer would make a restored backup from
+    a differently-configured book unloadable.
+    """
+
+    @classmethod
+    def check_currency(cls, value: object) -> str:
+        text = str(value or "BRL").upper()
+        if len(text) != 3 or not text.isalpha():
+            raise ValueError("Currency must be a 3-letter code such as BRL or EUR.")
+        return text
+
+
 class AccountIn(BaseIn, MoneyMixin):
     name: str = Field(min_length=1, max_length=120)
     type: str = AccountType.CHECKING.value
@@ -160,6 +177,11 @@ class TransactionIn(BaseIn, MoneyMixin):
     category_id: Optional[int] = None
     account_id: Optional[int] = None
     to_account_id: Optional[int] = None
+    #: Magnitude arriving at ``to_account_id`` when the two sides hold
+    #: different currencies. ``None`` otherwise.
+    to_amount: Optional[Decimal] = None
+    #: Always recomputed from the two amounts — never trusted from the payload.
+    fx_rate: Optional[Decimal] = None
     goal_id: Optional[int] = None
     debt_id: Optional[int] = None
     payment_method: Optional[str] = None
@@ -207,8 +229,22 @@ class TransactionIn(BaseIn, MoneyMixin):
             if self.account_id == self.to_account_id:
                 raise ValueError("A transfer cannot have the same account on both sides.")
             self.category_id = None
+            if self.to_amount is not None:
+                self.to_amount = MoneyMixin.check_amount(
+                    self.to_amount, "Amount received", allow_zero=False)
+                # Derived here so a payload can never disagree with its own
+                # amounts. Whether a cross-currency transfer *requires* a
+                # ``to_amount`` needs both accounts, so that check lives in
+                # ``transaction_service._validate_relations``.
+                from services.currency_service import derive_fx_rate
+
+                self.fx_rate = derive_fx_rate(self.amount, self.to_amount)
+            else:
+                self.fx_rate = None
         else:
             self.to_account_id = None
+            self.to_amount = None
+            self.fx_rate = None
             if not self.account_id:
                 raise ValueError("Choose the account this transaction belongs to.")
         if self.status == TxnStatus.COMPLETED.value and self.actual_date is None:
@@ -228,10 +264,17 @@ class TransferIn(BaseIn, MoneyMixin):
     amount: Decimal
     from_account_id: int
     to_account_id: int
+    #: Set only when the two accounts hold different currencies.
+    to_amount: Optional[Decimal] = None
     description: str = "Transfer"
     notes: Optional[str] = None
     payment_method: Optional[str] = None
     status: str = TxnStatus.COMPLETED.value
+    # Present so every transfer in the app can route through one constructor.
+    # Their absence is precisely why six call sites hand-rolled the payload.
+    actual_date: Optional[date] = None
+    goal_id: Optional[int] = None
+    debt_id: Optional[int] = None
 
     @field_validator("amount", mode="before")
     @classmethod
@@ -246,6 +289,7 @@ class TransferIn(BaseIn, MoneyMixin):
 
 
 class RecurringRuleIn(BaseIn, MoneyMixin):
+    currency: str = "BRL"
     name: str = Field(min_length=1, max_length=160)
     kind: str = TxnKind.EXPENSE.value
     amount: Decimal
@@ -339,8 +383,14 @@ class RecurringRuleIn(BaseIn, MoneyMixin):
             self.day_of_month = self.start_date.day
         return self
 
+    @field_validator("currency")
+    @classmethod
+    def _currency(cls, value: object) -> str:
+        return CurrencyMixin.check_currency(value)
+
 
 class BudgetLineIn(BaseIn, MoneyMixin):
+    currency: str = "BRL"
     kind: str = CategoryKind.EXPENSE.value
     target: str = AllocationTarget.EXPENSE.value
     planned_amount: Decimal = Decimal("0")
@@ -380,8 +430,14 @@ class BudgetLineIn(BaseIn, MoneyMixin):
             raise ValueError("A budget line needs a category, a goal, a debt, or a label.")
         return self
 
+    @field_validator("currency")
+    @classmethod
+    def _currency(cls, value: object) -> str:
+        return CurrencyMixin.check_currency(value)
+
 
 class GoalIn(BaseIn, MoneyMixin):
+    currency: str = "BRL"
     name: str = Field(min_length=1, max_length=160)
     goal_type: str = GoalType.CUSTOM.value
     target_amount: Decimal
@@ -415,8 +471,14 @@ class GoalIn(BaseIn, MoneyMixin):
             raise ValueError("The starting amount is already above the target.")
         return self
 
+    @field_validator("currency")
+    @classmethod
+    def _currency(cls, value: object) -> str:
+        return CurrencyMixin.check_currency(value)
+
 
 class DebtIn(BaseIn, MoneyMixin):
+    currency: str = "BRL"
     name: str = Field(min_length=1, max_length=160)
     debt_type: str = DebtType.OTHER.value
     principal_balance: Decimal
@@ -457,9 +519,17 @@ class DebtIn(BaseIn, MoneyMixin):
             raise ValueError("Interest rate above 1000% a year is almost certainly a typo.")
         return amount
 
+    @field_validator("currency")
+    @classmethod
+    def _currency(cls, value: object) -> str:
+        return CurrencyMixin.check_currency(value)
+
 
 class SettingsIn(BaseIn):
     base_currency: str = "BRL"
+    #: Every currency the book uses. Normalised below; the primary is forced to
+    #: the front whether or not the caller included it.
+    active_currencies: list[str] = Field(default_factory=lambda: ["BRL"])
     date_format: str = "DD/MM/YYYY"
     show_cents: bool = True
     first_day_of_month: int = Field(default=1, ge=1, le=28)
@@ -491,10 +561,42 @@ class SettingsIn(BaseIn):
             raise ValueError("Thresholds must be between 0% and 1000%.")
         return amount
 
+    @field_validator("base_currency")
+    @classmethod
+    def _base_currency(cls, value: str) -> str:
+        from constants import SUPPORTED_CURRENCIES
+
+        text = (value or "BRL").upper()
+        if text not in SUPPORTED_CURRENCIES:
+            raise ValueError(f"{text} is not a currency this app can format.")
+        return text
+
     @model_validator(mode="after")
     def _ordered(self) -> "SettingsIn":
         if self.critical_threshold_pct < self.warning_threshold_pct:
             raise ValueError("The critical threshold must be at or above the warning threshold.")
+        return self
+
+    @model_validator(mode="after")
+    def _currencies(self) -> "SettingsIn":
+        """Normalise the currency list. The only place the ≤3 cap is enforced."""
+        from constants import SUPPORTED_CURRENCIES
+        from services.currency_service import MAX_CURRENCIES
+
+        primary = self.base_currency
+        cleaned: list[str] = [primary]
+        for code in self.active_currencies or []:
+            text = str(code or "").strip().upper()
+            if not text or text in cleaned:
+                continue
+            if text not in SUPPORTED_CURRENCIES:
+                raise ValueError(f"{text} is not a currency this app can format.")
+            cleaned.append(text)
+        if len(cleaned) > MAX_CURRENCIES:
+            raise ValueError(
+                f"This app handles at most {MAX_CURRENCIES} currencies at once."
+            )
+        self.active_currencies = cleaned
         return self
 
 

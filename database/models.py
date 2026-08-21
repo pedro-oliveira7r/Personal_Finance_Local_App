@@ -155,6 +155,10 @@ class AppSettings(Base, TimestampMixin):
     theme: Mapped[str] = mapped_column(String(16), default="auto", nullable=False)
     backup_dir: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dashboard_prefs: Mapped[Optional[dict]] = mapped_column(JSONText, nullable=True)
+    #: Currency codes this book uses, primary first. At most three; validated
+    #: in :class:`schemas.validation.SettingsIn`. ``None`` on an old book means
+    #: "just the primary" — the migration backfills it.
+    active_currencies: Mapped[Optional[list]] = mapped_column(JSONText, nullable=True)
 
     onboarded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -325,6 +329,8 @@ class RecurringRule(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    #: Denomination of ``amount``. Defaults to the book's primary currency.
+    currency: Mapped[str] = mapped_column(String(3), default="BRL", nullable=False)
 
     category_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("categories.id", ondelete="SET NULL"), nullable=True
@@ -418,6 +424,13 @@ class Transaction(Base, TimestampMixin):
 
     description: Mapped[str] = mapped_column(String(240), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Money, nullable=False)
+    #: Magnitude ARRIVING at ``to_account_id``, in that account's currency.
+    #: ``None`` means the two sides share a currency — the overwhelming case,
+    #: and what keeps every pre-multi-currency row correct without a backfill.
+    to_amount: Mapped[Optional[Decimal]] = mapped_column(Money, nullable=True)
+    #: ``amount / to_amount`` — source units per 1 destination unit. Derived and
+    #: stored for the record; never used to reconstruct either amount.
+    fx_rate: Mapped[Optional[Decimal]] = mapped_column(Rate, nullable=True)
     kind: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(
         String(16), default=TxnStatus.COMPLETED.value, nullable=False
@@ -501,8 +514,20 @@ class Transaction(Base, TimestampMixin):
         return self.actual_date or self.txn_date
 
     @property
+    def is_fx(self) -> bool:
+        """True when the two sides of this transfer hold different currencies."""
+        return self.kind == TxnKind.TRANSFER.value and self.to_amount is not None
+
+    @property
     def signed_amount(self) -> Decimal:
-        """Positive for income, negative for expense, zero-sum for transfers."""
+        """Positive for income, negative for expense, zero-sum for transfers.
+
+        Transfers stay zero even when :attr:`is_fx` — deliberately. A
+        cross-currency transfer moves one magnitude out and a *different*
+        magnitude in, denominated differently, and this property has no way to
+        say which currency it would be returning. Render such a transfer as
+        both legs (``R$ 1.000,00 → € 160,00``) rather than signing it here.
+        """
         if self.kind == TxnKind.INCOME.value:
             return money(self.amount)
         if self.kind == TxnKind.EXPENSE.value:
@@ -594,6 +619,8 @@ class BudgetLine(Base, TimestampMixin):
 
     label: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
     planned_amount: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+    #: Denomination of the money on this row.
+    currency: Mapped[str] = mapped_column(String(3), default="BRL", nullable=False)
     expected_day: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     #: True once the user edits a value that was generated from a rule, so
@@ -645,6 +672,8 @@ class Goal(Base, TimestampMixin):
     #: Money already set aside before the app started tracking.
     starting_amount: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
     planned_monthly: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+    #: Denomination of the money on this row.
+    currency: Mapped[str] = mapped_column(String(3), default="BRL", nullable=False)
     target_date: Mapped[Optional[date]] = mapped_column(Date, nullable=True)
     start_date: Mapped[date] = mapped_column(Date, default=date.today, nullable=False)
 
@@ -694,6 +723,8 @@ class Debt(Base, TimestampMixin):
     minimum_payment: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
     planned_payment: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
     extra_payment: Mapped[Decimal] = mapped_column(Money, default=Decimal("0"), nullable=False)
+    #: Denomination of the money on this row.
+    currency: Mapped[str] = mapped_column(String(3), default="BRL", nullable=False)
     due_day: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     account_id: Mapped[Optional[int]] = mapped_column(
@@ -735,14 +766,21 @@ class NetWorthSnapshot(Base, TimestampMixin):
     __tablename__ = "net_worth_snapshots"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    as_of_date: Mapped[date] = mapped_column(Date, nullable=False, unique=True)
+    #: Not unique on its own any more — one row per currency per date. A
+    #: snapshot is a record of what each currency was worth, not a single
+    #: converted figure that would silently re-value whenever a rate moved.
+    as_of_date: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), default="BRL", nullable=False)
     total_assets: Mapped[Decimal] = mapped_column(Money, nullable=False)
     total_liabilities: Mapped[Decimal] = mapped_column(Money, nullable=False)
     net_worth: Mapped[Decimal] = mapped_column(Money, nullable=False)
     detail: Mapped[Optional[dict]] = mapped_column(JSONText, nullable=True)
     is_manual: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
-    __table_args__ = (Index("ix_nw_date", "as_of_date"),)
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "currency", name="uq_nw_date_currency"),
+        Index("ix_nw_date", "as_of_date"),
+    )
 
 
 # ==========================================================================
@@ -779,6 +817,37 @@ class RecycleBin(Base):
     __table_args__ = (Index("ix_recycle_type", "entity_type", "restored_at"),)
 
 
+class ExchangeRate(Base, TimestampMixin):
+    """One dated quote: how many units of ``base_currency`` buy 1 ``currency``.
+
+    ``base_currency`` is stored rather than assumed. Without it a row silently
+    changes meaning the moment the book's primary currency is switched, and the
+    ambiguity would be undetectable after the fact.
+
+    The book keeps a daily log, but conversion always reads the most recent row
+    per currency — see :func:`services.currency_service.book`.
+    """
+
+    __tablename__ = "exchange_rates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    as_of_date: Mapped[date] = mapped_column(Date, nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    base_currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    rate: Mapped[Decimal] = mapped_column(Rate, nullable=False)
+    source: Mapped[str] = mapped_column(String(16), default="manual", nullable=False)
+    notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("as_of_date", "currency", "base_currency",
+                         name="uq_fx_date_pair"),
+        Index("ix_fx_pair_date", "currency", "base_currency", "as_of_date"),
+    )
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return f"<ExchangeRate {self.as_of_date} 1 {self.currency}={self.rate} {self.base_currency}>"
+
+
 class SchemaMeta(Base):
     """Tracks the applied migration version."""
 
@@ -791,5 +860,5 @@ class SchemaMeta(Base):
 ALL_MODELS = [
     AppSettings, Category, Account, AccountValuation, RecurringRule,
     Transaction, BudgetPeriod, BudgetLine, Goal, Debt, NetWorthSnapshot,
-    ImportBatch, RecycleBin, SchemaMeta,
+    ImportBatch, RecycleBin, ExchangeRate, SchemaMeta,
 ]

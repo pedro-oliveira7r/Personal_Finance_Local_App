@@ -54,15 +54,25 @@ def normalise_description(text: str) -> str:
 
 
 def fingerprint(txn_date: date, amount: Decimal, description: str,
-                account_id: Optional[int], kind: str) -> str:
-    payload = "|".join([
+                account_id: Optional[int], kind: str,
+                to_amount: Optional[Decimal] = None) -> str:
+    """Duplicate-detection key.
+
+    ``to_amount`` is appended **only when it exists**. Appending it
+    unconditionally — even as an empty string — adds a separator and changes
+    the hash of every row already on file, which would silently switch off
+    duplicate detection across the user's whole history.
+    """
+    parts = [
         txn_date.isoformat(),
         f"{money(amount):.2f}",
         normalise_description(description),
         str(account_id or ""),
         kind,
-    ])
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    ]
+    if to_amount is not None:
+        parts.append(f"{money(to_amount):.2f}")
+    return hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
 
 
 # ==========================================================================
@@ -76,6 +86,9 @@ class TxnFilter:
     statuses: Optional[Sequence[str]] = None
     category_ids: Optional[Sequence[int]] = None
     account_ids: Optional[Sequence[int]] = None
+    #: Narrow to transactions whose **source** account holds this currency.
+    #: That is the denomination of ``amount``, which is what every caller sums.
+    currency: Optional[str] = None
     goal_id: Optional[int] = None
     debt_id: Optional[int] = None
     rule_id: Optional[int] = None
@@ -124,6 +137,13 @@ def _build_stmt(flt: TxnFilter, *, count_only: bool = False):
             Transaction.account_id.in_(ids),
             Transaction.to_account_id.in_(ids),
         ))
+    if flt.currency:
+        stmt = stmt.where(
+            Transaction.account_id.in_(
+                select(Account.id).where(
+                    func.upper(Account.currency) == flt.currency.upper())
+            )
+        )
     if flt.goal_id is not None:
         stmt = stmt.where(Transaction.goal_id == flt.goal_id)
     if flt.debt_id is not None:
@@ -225,8 +245,23 @@ def find_duplicates(
 # Writes
 # ==========================================================================
 def _validate_relations(session: Session, data: TransactionIn) -> None:
-    ensure_exists(session, Account, data.account_id, "Account")
-    ensure_exists(session, Account, data.to_account_id, "Destination account")
+    source = ensure_exists(session, Account, data.account_id, "Account")
+    target = ensure_exists(session, Account, data.to_account_id, "Destination account")
+    # Whether a transfer needs a second amount depends on the two accounts, so
+    # it cannot live in the schema — that has no session to look them up with.
+    if data.kind == TxnKind.TRANSFER.value and source is not None and target is not None:
+        if source.currency != target.currency:
+            if data.to_amount is None:
+                raise ServiceError(
+                    f"“{source.name}” holds {source.currency} and “{target.name}” holds "
+                    f"{target.currency}. Enter the amount that arrived as well, so the "
+                    f"rate can be recorded."
+                )
+        elif data.to_amount is not None and money(data.to_amount) != money(data.amount):
+            raise ServiceError(
+                f"Both accounts hold {source.currency}, so the amount that arrives "
+                f"must match the amount sent."
+            )
     if data.category_id:
         category = ensure_exists(session, Category, data.category_id, "Category")
         if category is not None:
@@ -263,7 +298,7 @@ def create_transaction(
         exact = [t for t in duplicates
                  if t.fingerprint == fingerprint(
                      data.txn_date, data.amount, data.description,
-                     data.account_id, data.kind)]
+                     data.account_id, data.kind, data.to_amount)]
         if exact:
             raise ConflictError(
                 f"An identical transaction already exists on "
@@ -278,7 +313,8 @@ def create_transaction(
         occurrence_key=occurrence_key,
         import_batch_id=import_batch_id,
         fingerprint=fingerprint(
-            data.txn_date, data.amount, data.description, data.account_id, data.kind
+            data.txn_date, data.amount, data.description, data.account_id,
+            data.kind, data.to_amount,
         ),
     )
     session.add(txn)
@@ -299,6 +335,10 @@ def update_transaction(session: Session, txn_id: int, payload: dict[str, Any]) -
         "category_id": txn.category_id,
         "account_id": txn.account_id,
         "to_account_id": txn.to_account_id,
+        # Omitting these would silently blank an FX transfer on any edit:
+        # BaseIn ignores unknown keys, so nothing would complain.
+        "to_amount": txn.to_amount,
+        "fx_rate": txn.fx_rate,
         "goal_id": txn.goal_id,
         "debt_id": txn.debt_id,
         "payment_method": txn.payment_method,
@@ -312,34 +352,57 @@ def update_transaction(session: Session, txn_id: int, payload: dict[str, Any]) -
     _validate_relations(session, data)
     apply_fields(txn, data.model_dump())
     txn.fingerprint = fingerprint(
-        data.txn_date, data.amount, data.description, data.account_id, data.kind
+        data.txn_date, data.amount, data.description, data.account_id,
+        data.kind, data.to_amount,
     )
     session.flush()
     return txn
 
 
-def create_transfer(session: Session, payload: dict[str, Any],
-                    *, allow_duplicate: bool = False) -> Transaction:
+def create_transfer(session: Session, payload: dict[str, Any], *,
+                    allow_duplicate: bool = False,
+                    rule_id: Optional[int] = None,
+                    occurrence_key: Optional[str] = None,
+                    import_batch_id: Optional[int] = None) -> Transaction:
+    """The one way to move money between accounts.
+
+    It carries ``goal_id``/``debt_id``/``actual_date`` and the import and rule
+    identifiers because their absence is exactly why every caller used to build
+    the payload by hand — and hand-built payloads are how a cross-currency
+    transfer ends up without the second amount that makes it correct.
+    """
     data = TransferIn(**payload)
     return create_transaction(session, {
         "txn_date": data.txn_date,
         "description": data.description or "Transfer",
         "amount": data.amount,
+        "to_amount": data.to_amount,
         "kind": TxnKind.TRANSFER.value,
         "status": data.status,
+        "actual_date": data.actual_date,
         "account_id": data.from_account_id,
         "to_account_id": data.to_account_id,
+        "goal_id": data.goal_id,
+        "debt_id": data.debt_id,
         "payment_method": data.payment_method,
         "notes": data.notes,
-    }, allow_duplicate=allow_duplicate)
+    }, allow_duplicate=allow_duplicate, rule_id=rule_id,
+       occurrence_key=occurrence_key, import_batch_id=import_batch_id)
 
 
 def complete_transaction(session: Session, txn_id: int, *,
                          actual_date: Optional[date] = None,
-                         actual_amount: Optional[Decimal] = None) -> Transaction:
-    """Mark a planned transaction as done, optionally correcting the amount."""
+                         actual_amount: Optional[Decimal] = None,
+                         actual_to_amount: Optional[Decimal] = None) -> Transaction:
+    """Mark a planned transaction as done, optionally correcting the amounts.
+
+    Correcting one leg of an FX transfer without the other would leave
+    ``fx_rate`` describing a trade that no longer matches its own amounts, so
+    the rate is re-derived whenever either side moves.
+    """
     txn = get_transaction(session, txn_id)
-    if txn.status == TxnStatus.COMPLETED.value and actual_amount is None:
+    if (txn.status == TxnStatus.COMPLETED.value
+            and actual_amount is None and actual_to_amount is None):
         return txn
     txn.status = TxnStatus.COMPLETED.value
     txn.actual_date = actual_date or txn.actual_date or txn.txn_date
@@ -348,8 +411,21 @@ def complete_transaction(session: Session, txn_id: int, *,
         if amount <= 0:
             raise ServiceError("The actual amount must be greater than zero.")
         txn.amount = amount
+    if actual_to_amount is not None:
+        if txn.to_amount is None:
+            raise ServiceError("This transfer does not cross currencies.")
+        received = money(actual_to_amount)
+        if received <= 0:
+            raise ServiceError("The amount that arrived must be greater than zero.")
+        txn.to_amount = received
+    if txn.to_amount is not None and (actual_amount is not None
+                                      or actual_to_amount is not None):
+        from services.currency_service import derive_fx_rate
+
+        txn.fx_rate = derive_fx_rate(txn.amount, txn.to_amount)
     txn.fingerprint = fingerprint(
-        txn.txn_date, txn.amount, txn.description, txn.account_id, txn.kind
+        txn.txn_date, txn.amount, txn.description, txn.account_id, txn.kind,
+        txn.to_amount,
     )
     session.flush()
     return txn
@@ -469,6 +545,7 @@ def actuals_for_period(
     *,
     include_planned: bool = False,
     use_effective_date: bool = True,
+    currency: Optional[str] = None,
 ) -> ActualsByCategory:
     """Sum completed movements per category inside a period."""
     statuses = [TxnStatus.COMPLETED.value]
@@ -476,7 +553,7 @@ def actuals_for_period(
         statuses.append(TxnStatus.PLANNED.value)
     txns = list_transactions(session, TxnFilter(
         start=period.start, end=period.end, statuses=statuses,
-        use_effective_date=use_effective_date,
+        use_effective_date=use_effective_date, currency=currency,
     ))
     parents = {
         row[0]: row[1]

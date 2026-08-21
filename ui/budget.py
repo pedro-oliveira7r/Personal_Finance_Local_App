@@ -39,27 +39,31 @@ def render() -> None:
         "Give every unit of income a job. Available money − allocations = zero.",
         icon="🧮",
     )
-    period = ui.period_picker(key="budget_period")
+    picker, period_col = st.columns([0.32, 0.68])
+    with picker:
+        # No "All": zero-based balance is a per-currency identity, and a
+        # converted total is not something you can hand out to categories.
+        currency = ui.currency_picker(key="budget_currency", include_all=False)
+    with period_col:
+        period = ui.period_picker(key="budget_period")
 
-    tabs = st.tabs(["This period", "Plan ahead", "Recurring rules"])
+    tabs = st.tabs(["This period", "Recurring rules"])
     with tabs[0]:
-        _single_period(period)
+        _single_period(period, currency)
     with tabs[1]:
-        _multi_period(period)
-    with tabs[2]:
         _rules()
 
 
 # ==========================================================================
 # One period
 # ==========================================================================
-def _single_period(period) -> None:
-    fmt = ui.formatter()
+def _single_period(period, currency: str | None = None) -> None:
+    fmt = ui.formatter(currency)
     settings = ui.current_settings()
-    theme = ui.theme()
+    theme = ui.theme(currency)
 
     with ui.db_read() as session:
-        summary = budget_service.summarise_period(session, period)
+        summary = budget_service.summarise_period(session, period, currency=currency)
         income_options = category_service.options_for_select(
             session, kinds=[CategoryKind.INCOME.value])
         allocation_options = category_service.options_for_select(
@@ -512,115 +516,6 @@ def _add_line_form(period, income_options, allocation_options,
                             session, period.year, period.month, payload),
                         success="Budget line saved.",
                     )
-
-
-# ==========================================================================
-# Multiple periods
-# ==========================================================================
-def _multi_period(period) -> None:
-    fmt = ui.formatter()
-    settings = ui.current_settings()
-
-    ui.section(
-        "Plan several periods at once",
-        "Rules know which months an annual insurance, a quarterly tax or a December "
-        "bonus belongs to, so generating a year at a time still lands the right "
-        "amounts in the right months.",
-    )
-
-    columns = st.columns([0.28, 0.24, 0.24, 0.24])
-    with columns[0]:
-        start_choice = st.selectbox(
-            "Start from", ["This period", "Next period", "Next January"],
-            key="multi_start",
-        )
-    with columns[1]:
-        count = st.number_input("How many periods", min_value=1, max_value=60,
-                                value=12, step=1, key="multi_count")
-    with columns[2]:
-        source = st.selectbox(
-            "Build from", ["rules", "copy"],
-            format_func=lambda item: ("Recurring rules" if item == "rules"
-                                      else "Copy a template period"),
-            key="multi_source",
-        )
-    with columns[3]:
-        growth = ui.pct_input("Yearly growth", ZERO, key="multi_growth",
-                              help_text="Applied once per completed year of distance "
-                                        "when copying a template.",
-                              min_value=-50.0, max_value=100.0)
-
-    if start_choice == "This period":
-        start = period
-    elif start_choice == "Next period":
-        start = shift_period(period, 1, settings.first_day_of_month)
-    else:
-        year = period.year + (1 if period.month >= 1 else 0)
-        start = settings.period(year if period.month > 1 else period.year, 1)
-
-    template = None
-    if source == "copy":
-        template = shift_period(period, -1, settings.first_day_of_month)
-        st.caption(f"Template: **{template.label}** (the period before the one selected).")
-
-    overwrite = st.checkbox(
-        "Overwrite lines I edited by hand", value=False, key="multi_overwrite",
-        help="Off by default: your manual overrides survive regeneration.",
-    )
-
-    end = shift_period(start, int(count) - 1, settings.first_day_of_month)
-    st.info(f"This will create or update budgets from **{start.label}** to "
-            f"**{end.label}** ({int(count)} period(s)).", icon="🗓️")
-
-    if st.button("Generate the range", type="primary", key="multi_go"):
-        def action(session):
-            return budget_service.generate_range(
-                session, start, int(count), source=source,
-                template_period=template, growth_pct=growth,
-                overwrite_overrides=overwrite,
-            )
-
-        reports = ui.run_action(action, rerun=False,
-                                spinner="Building budgets…")
-        if reports:
-            created = sum(r.created for r in reports)
-            updated = sum(r.updated for r in reports)
-            kept = sum(r.skipped_overrides for r in reports)
-            ui.flash(f"{len(reports)} period(s) planned · {created} line(s) added · "
-                     f"{updated} updated · {kept} manual override(s) preserved.")
-            st.rerun()
-
-    ui.divider()
-    _range_overview(start, int(count), fmt)
-
-
-def _range_overview(start, count: int, fmt: ui.Formatter) -> None:
-    settings = ui.current_settings()
-    periods = [shift_period(start, offset, settings.first_day_of_month)
-               for offset in range(min(count, 24))]
-    with ui.db_read() as session:
-        rows = []
-        for item in periods:
-            summary = budget_service.summarise_period(session, item)
-            rows.append({
-                "period": item.label,
-                "status": (summary.row.status.title() if summary.row else "No plan"),
-                "income": summary.result.planned_income,
-                "allocated": summary.result.allocated,
-                "available": summary.result.available,
-                "remaining": summary.result.remaining,
-                "state": summary.result.status_label,
-                "lines": summary.line_count,
-            })
-    ui.section("What those periods look like now")
-    ui.money_table(
-        rows,
-        [("period", "Period", "text"), ("status", "Status", "text"),
-         ("lines", "Lines", "int"), ("income", "Expected income", "money"),
-         ("available", "Available", "money"), ("allocated", "Allocated", "money"),
-         ("remaining", "Left over", "money"), ("state", "Zero-based", "text")],
-        fmt, height=min(560, 60 + 36 * len(rows)),
-    )
 
 
 # ==========================================================================

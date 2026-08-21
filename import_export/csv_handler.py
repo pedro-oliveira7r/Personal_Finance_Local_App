@@ -40,6 +40,11 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "subcategory": ["subcategory", "subcategoria", "sub category", "sub-categoria"],
     "account": ["account", "conta", "from account", "conta origem", "bank", "banco"],
     "to_account": ["to account", "conta destino", "destination", "destino"],
+    # Cross-currency transfers need the far leg. Without it the destination is
+    # credited with the source currency's magnitude, so the importer refuses
+    # the row rather than inventing a rate for it.
+    "to_amount": ["to amount", "amount received", "received", "valor recebido",
+                  "valor destino", "credited"],
     "payment_method": ["payment method", "forma de pagamento", "método", "metodo",
                        "payment", "meio de pagamento"],
     "tags": ["tags", "etiquetas", "labels", "marcadores"],
@@ -53,9 +58,9 @@ DATE_PATTERNS = [
 ]
 
 EXPORT_COLUMNS = [
-    "date", "actual_date", "description", "amount", "kind", "status",
-    "category", "account", "to_account", "payment_method", "tags",
-    "notes", "is_planned", "goal", "debt",
+    "date", "actual_date", "description", "amount", "currency", "kind", "status",
+    "category", "account", "to_account", "to_amount", "fx_rate", "payment_method",
+    "tags", "notes", "is_planned", "goal", "debt",
 ]
 
 
@@ -315,6 +320,7 @@ def build_preview(
             continue
 
         to_account_id = None
+        to_amount = None
         to_name = column(record, "to_account")
         if kind == TxnKind.TRANSFER.value:
             target = accounts.get(to_name.strip().lower()) if to_name else None
@@ -325,6 +331,28 @@ def build_preview(
                 )
                 continue
             to_account_id = target.id
+            source = next((a for a in accounts.values() if a.id == account_id), None)
+            if source is not None and source.currency != target.currency:
+                raw_received = column(record, "to_amount")
+                if not raw_received:
+                    # Refuse rather than convert. A rate invented at import time
+                    # is indistinguishable from a real one afterwards, and the
+                    # error is permanent.
+                    prepared.error = (
+                        f"“{source.name}” holds {source.currency} and "
+                        f"“{target.name}” holds {target.currency}. Add an "
+                        f"“amount received” column so the rate can be recorded."
+                    )
+                    continue
+                try:
+                    to_amount = parse_money(raw_received)
+                except Exception:
+                    prepared.error = f"Could not read the amount received " \
+                                     f"(“{raw_received}”)."
+                    continue
+                if to_amount <= 0:
+                    prepared.error = "The amount received must be greater than zero."
+                    continue
 
         category_id = None
         category_path = column(record, "category")
@@ -359,6 +387,7 @@ def build_preview(
             "category_id": category_id,
             "account_id": account_id,
             "to_account_id": to_account_id,
+            "to_amount": to_amount,
             "payment_method": column(record, "payment_method") or None,
             "tags": column(record, "tags") or None,
             "notes": column(record, "notes") or None,
@@ -528,8 +557,9 @@ def list_batches(session: Session, limit: int = 25) -> list[ImportBatch]:
 def transactions_to_csv(session: Session, transactions: Iterable[Transaction],
                         *, delimiter: str = ",") -> str:
     categories = category_name_map(session)
-    accounts = {a.id: a.name for a in account_service.list_accounts(
-        session, include_archived=True)}
+    all_accounts = account_service.list_accounts(session, include_archived=True)
+    accounts = {a.id: a.name for a in all_accounts}
+    account_currency = {a.id: a.currency for a in all_accounts}
     from database.models import Debt, Goal
 
     goals = {row[0]: row[1] for row in session.execute(select(Goal.id, Goal.name)).all()}
@@ -544,11 +574,14 @@ def transactions_to_csv(session: Session, transactions: Iterable[Transaction],
             txn.actual_date.isoformat() if txn.actual_date else "",
             txn.description,
             f"{txn.amount:.2f}",
+            account_currency.get(txn.account_id, ""),
             txn.kind,
             txn.status,
             categories.get(txn.category_id, "") if txn.category_id else "",
             accounts.get(txn.account_id, "") if txn.account_id else "",
             accounts.get(txn.to_account_id, "") if txn.to_account_id else "",
+            f"{txn.to_amount:.2f}" if txn.to_amount is not None else "",
+            f"{txn.fx_rate:.6f}" if txn.fx_rate is not None else "",
             txn.payment_method or "",
             txn.tags or "",
             (txn.notes or "").replace("\n", " "),

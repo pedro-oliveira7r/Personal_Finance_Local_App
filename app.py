@@ -33,7 +33,6 @@ PAGES = [
     ("Accounts", "🏦", "accounts"),
     ("Goals & debts", "🚩", "goals"),
     ("Forecast", "🔮", "forecast"),
-    ("Reports", "📈", "reports"),
     ("Settings", "⚙️", "settings"),
 ]
 
@@ -126,26 +125,48 @@ def sidebar() -> str:
         _sidebar_snapshot()
         ui.divider()
         st.caption(f"Data stored locally at\n`{config.db_path()}`")
-        st.caption(f"v{config.APP_VERSION} · currency {settings.base_currency}")
+        st.caption(f"v{config.APP_VERSION} · "
+                   f"{' · '.join(settings.active_currencies)}")
     return slug
 
 
 def _sidebar_snapshot() -> None:
-    """A tiny always-visible position summary."""
+    """A tiny always-visible position summary.
+
+    The sidebar sits on every page and has no currency picker of its own, so on
+    a multi-currency book it shows one block per currency and never a combined
+    line — a single number here could only be a conversion, and the sidebar is
+    the last place to quietly apply a rate.
+    """
     from services import account_service
 
     fmt = ui.formatter()
     try:
         with ui.db_read() as session:
+            # Loaded once and partitioned in Python: balance_views reads every
+            # transaction in the book, so calling it per currency would pay
+            # that cost again for each one.
             views = account_service.balance_views(session)
-            totals = account_service.totals(views)
+            by_currency = account_service.totals_by_currency(views)
     except Exception:
         return
+    if not by_currency:
+        return
+
+    book = ui.currency_book()
+    ordered = [c for c in book.active if c in by_currency]
+    ordered += [c for c in by_currency if c not in ordered]
+
     st.markdown("**Right now**")
-    st.metric("Cash available", fmt.money(totals.cash))
-    st.metric("Net worth", fmt.money(totals.net_worth))
-    if totals.liabilities:
-        st.metric("Total owed", fmt.money(totals.liabilities))
+    for code in ordered:
+        totals = by_currency[code]
+        money = fmt.for_currency(code)
+        if len(ordered) > 1:
+            st.caption(f"{book.symbol(code)} {code}")
+        st.metric("Cash available", money.money(totals.cash))
+        st.metric("Net worth", money.money(totals.net_worth))
+        if totals.liabilities:
+            st.metric("Total owed", money.money(totals.liabilities))
 
 
 def render(slug: str) -> None:
@@ -163,8 +184,6 @@ def render(slug: str) -> None:
         from ui import goals as page
     elif slug == "forecast":
         from ui import forecast as page
-    elif slug == "reports":
-        from ui import reports as page
     else:
         from ui import settings as page
     page.render()

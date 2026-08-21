@@ -7,16 +7,12 @@ from datetime import date
 import streamlit as st
 
 from calculations.money import ZERO, money, money_sum
-from calculations.variance import pace_projection
-from charts import dashboard_charts as dc
 from constants import TxnStatus
 from services import budget_service, transaction_service
 from ui import components as ui
 
 
 def render() -> None:
-    fmt = ui.formatter()
-    theme = ui.theme()
     today = date.today()
 
     ui.page_header(
@@ -25,10 +21,18 @@ def render() -> None:
         "actually happened.",
         icon="🎯",
     )
-    period = ui.period_picker(key="track_period")
+    picker, period_col = st.columns([0.32, 0.68])
+    with picker:
+        # Per-currency only, for the same reason as Budget planning: a
+        # converted plan-vs-actual is not something you can act on.
+        currency = ui.currency_picker(key="track_currency", include_all=False)
+    with period_col:
+        period = ui.period_picker(key="track_period")
+    fmt = ui.formatter(currency)
 
     with ui.db_read() as session:
-        tracking = budget_service.track_period(session, period, today=today)
+        tracking = budget_service.track_period(session, period, today=today,
+                                               currency=currency)
         planned = transaction_service.list_transactions(
             session,
             transaction_service.TxnFilter(
@@ -52,15 +56,11 @@ def render() -> None:
     _summary(tracking, fmt, elapsed_pct)
     ui.divider()
 
-    tabs = st.tabs(["Line by line", "Charts", "Mark things done", "Pace check"])
+    tabs = st.tabs(["Line by line", "Mark things done"])
     with tabs[0]:
         _lines(tracking, fmt)
     with tabs[1]:
-        _charts(tracking, theme)
-    with tabs[2]:
         _complete_planned(planned, overdue, fmt, period)
-    with tabs[3]:
-        _pace(tracking, fmt, elapsed_pct)
 
 
 def _goto(slug: str) -> None:
@@ -152,23 +152,6 @@ def _rows_to_csv(rows, fmt: ui.Formatter) -> str:
     ])
 
 
-def _charts(tracking, theme) -> None:
-    left, right = st.columns(2)
-    with left:
-        ui.section("Planned against actual")
-        ui.chart(dc.planned_vs_actual_bars(tracking.rows, theme, height=440, limit=14),
-                 key="track_pva")
-    with right:
-        ui.section("Budget consumed")
-        ui.chart(dc.utilisation_bullets(tracking.allocation_rows, theme, limit=12),
-                 key="track_util")
-    ui.divider()
-    ui.section("Distance from plan")
-    ui.chart(dc.variance_diverging_bars(tracking.allocation_rows, theme, height=360,
-                                        limit=14),
-             key="track_var")
-
-
 def _complete_planned(planned, overdue, fmt: ui.Formatter, period) -> None:
     ui.section(
         "Planned transactions in this period",
@@ -242,44 +225,3 @@ def _complete_planned(planned, overdue, fmt: ui.Formatter, period) -> None:
                 ui.flash(f"{count} transaction(s) marked as completed.")
                 st.rerun()
 
-
-def _pace(tracking, fmt: ui.Formatter, elapsed_pct: int) -> None:
-    ui.section(
-        "Are you on pace?",
-        "For each budgeted category, where the current rate of spending would land by "
-        "the end of the period. Only meaningful part-way through a period.",
-    )
-    if tracking.elapsed_fraction <= 0:
-        st.info("This period has not started yet.", icon="🗓️")
-        return
-    if tracking.elapsed_fraction >= 1:
-        st.info("This period is complete — the actual column is the final answer.",
-                icon="✅")
-
-    rows = []
-    for row in tracking.allocation_rows:
-        if row.planned <= 0:
-            continue
-        projected = pace_projection(row, tracking.elapsed_fraction)
-        overrun = money(projected - row.planned)
-        rows.append({
-            "label": f"{row.status_icon} {row.label}",
-            "planned": row.planned,
-            "actual": row.actual,
-            "projected": projected,
-            "overrun": overrun,
-            "verdict": "on pace" if overrun <= 0 else "heading over",
-        })
-    rows.sort(key=lambda item: item["overrun"], reverse=True)
-
-    if not rows:
-        st.caption("No budgeted categories to project.")
-        return
-    st.caption(f"{elapsed_pct}% of the period has passed.")
-    ui.money_table(
-        rows,
-        [("label", "Category", "text"), ("planned", "Planned", "money"),
-         ("actual", "So far", "money"), ("projected", "On pace for", "money"),
-         ("overrun", "Would exceed by", "money"), ("verdict", "Verdict", "text")],
-        fmt, height=min(560, 60 + 36 * len(rows)),
-    )

@@ -51,6 +51,7 @@ from database.models import (
 )
 from database.seed import seed_defaults
 from services import budget_service, category_service, networth_service
+from services.currency_service import legs_for_transfer
 from services.transaction_service import fingerprint
 
 DEMO_SEED = 20260817
@@ -79,7 +80,17 @@ DEMO_ACCOUNTS = [
     dict(name="Apartment", type=AccountType.OTHER_ASSET.value, icon="🏠",
          opening_balance="0", balance_mode="manual", include_in_cash=False,
          color="#008300"),
+    # Without a second currency in the demo book, no smoke test would ever
+    # exercise a multi-currency path.
+    dict(name="Euro savings", type=AccountType.SAVINGS.value, icon="🇪🇺",
+         opening_balance="4200", currency="EUR",
+         institution="Banco Europeu", color="#4a3aa7"),
 ]
+
+#: Roughly where EUR/BRL sat over the demo window, drifting rather than fixed
+#: so the rate log looks like something a person actually kept.
+DEMO_EUR_BASE = D("5.90")
+DEMO_EUR_DRIFT = D("0.55")
 
 #: ``jitter`` is the +/- fraction applied when a past occurrence is actualised.
 #: ``skip`` is the chance the payment simply did not happen that month.
@@ -235,6 +246,9 @@ DEMO_RULES: list[dict[str, Any]] = [
          account="Main checking", to_account="Car loan",
          frequency=Frequency.MONTHLY.value, day_of_month=15, jitter=0.0,
          debt="Car loan"),
+    dict(name="Euro savings top-up", kind="transfer", amount="600",
+         account="Main checking", to_account="Euro savings",
+         frequency=Frequency.MONTHLY.value, day_of_month=12, jitter=0.05),
     dict(name="Credit card payment", kind="transfer", amount="2350",
          account="Main checking", to_account="Credit card",
          frequency=Frequency.MONTHLY.value, day_of_month=10, jitter=0.15,
@@ -501,7 +515,8 @@ def _create_accounts(session: Session, opening: date,
         for key in ("credit_limit", "interest_rate"):
             if key in payload:
                 payload[key] = D(payload[key])
-        session.add(Account(currency="BRL", opening_date=opening, **payload))
+        payload.setdefault("currency", "BRL")
+        session.add(Account(opening_date=opening, **payload))
         report.accounts += 1
     session.flush()
     _retire_unused_defaults(session)
@@ -635,6 +650,9 @@ def _materialise(session: Session, rules: list[RecurringRule], start: date, end:
             except (KeyError, IndexError, ValueError):
                 description = rule.name
 
+            to_amount, fx_rate = legs_for_transfer(
+                session, rule.account_id, rule.to_account_id, amount
+            ) if rule.kind == TxnKind.TRANSFER.value else (None, None)
             session.add(Transaction(
                 txn_date=occurrence.due_date,
                 actual_date=actual_date,
@@ -643,6 +661,8 @@ def _materialise(session: Session, rules: list[RecurringRule], start: date, end:
                                    and occurrence.cash_date != occurrence.due_date else None),
                 description=description[:240],
                 amount=amount,
+                to_amount=to_amount,
+                fx_rate=fx_rate,
                 kind=rule.kind,
                 status=status,
                 category_id=rule.category_id,
@@ -655,7 +675,7 @@ def _materialise(session: Session, rules: list[RecurringRule], start: date, end:
                 tags=DEMO_TAG,
                 is_planned=True,
                 fingerprint=fingerprint(occurrence.due_date, amount, description,
-                                        rule.account_id, rule.kind),
+                                        rule.account_id, rule.kind, to_amount),
             ))
             if status == TxnStatus.COMPLETED.value:
                 report.transactions_completed += 1
@@ -847,6 +867,34 @@ def _add_snapshots(session: Session, first: Period, count: int,
 
 
 # --------------------------------------------------------------------------
+def _seed_rates(session: Session, first: date, last: date,
+                rng: random.Random, report: "DemoReport") -> int:
+    """A month-by-month EUR→BRL log across the demo window.
+
+    Only the newest row is ever used for conversion, but the history is what
+    makes the rate editor and its staleness caption look like a real book.
+    ``source="demo"`` marks them: rates carry no tag column, so this is how
+    ``clear_all_data`` can tell demo rates from ones the user typed.
+    """
+    from services.currency_service import set_rate
+
+    created = 0
+    cursor = date(first.year, first.month, 1)
+    step = 0
+    while cursor <= last:
+        drift = (D(str(rng.uniform(-1.0, 1.0))) * DEMO_EUR_DRIFT).quantize(D("0.0001"))
+        rate = (DEMO_EUR_BASE + drift + D(step) * D("0.02")).quantize(D("0.0001"))
+        if rate <= 0:
+            rate = DEMO_EUR_BASE
+        set_rate(session, "EUR", rate, as_of=cursor, source="demo")
+        created += 1
+        step += 1
+        cursor = (date(cursor.year + 1, 1, 1) if cursor.month == 12
+                  else date(cursor.year, cursor.month + 1, 1))
+    session.flush()
+    return created
+
+
 def load_demo_data(
     session: Session,
     *,
@@ -868,7 +916,12 @@ def load_demo_data(
     current = make_period(today.year, today.month)
     first = shift_period(current, -months_back + 1)
     last = shift_period(current, months_forward)
+
+    from services.currency_service import set_active_currencies
+
     accounts = _create_accounts(session, first.start, report)
+    set_active_currencies(session, ["EUR"])
+    _seed_rates(session, first.start, last.end, rng, report)
 
     goals = _create_goals(session, accounts, today, report)
     debts = _create_debts(session, accounts, today, report)
@@ -888,10 +941,14 @@ def load_demo_data(
 
 def clear_all_data(session: Session, *, keep_accounts: bool = True,
                    keep_categories: bool = True) -> dict[str, int]:
-    """Wipe transactional data, leaving a clean book. Irreversible.
+    """Wipe financial data, leaving a clean book. Irreversible.
 
     Categories and accounts are kept by default so the user does not have to
-    rebuild their setup after dismissing the demo.
+    rebuild their setup after dismissing the demo. Kept accounts are emptied,
+    not just detached from their transactions: an opening balance is a figure
+    the user is asking to be rid of, and leaving the demo's behind meant a
+    freshly cleared book still reported thousands in cash from nothing the
+    Accounts screen could explain.
     """
     counts: dict[str, int] = {}
     order = [
@@ -914,7 +971,9 @@ def clear_all_data(session: Session, *, keep_accounts: bool = True,
     for name, model in order:
         counts[name] = _count(model)
         session.execute(delete(model))
-    if not keep_accounts:
+    if keep_accounts:
+        counts["account_balances"] = _reset_account_balances(session)
+    else:
         counts["accounts"] = _count(Account)
         session.execute(delete(Account))
     if not keep_categories:
@@ -925,3 +984,20 @@ def clear_all_data(session: Session, *, keep_accounts: bool = True,
     session.flush()
     seed_defaults(session)
     return counts
+
+
+def _reset_account_balances(session: Session) -> int:
+    """Zero the opening balance of every surviving account.
+
+    Returns how many accounts actually carried a figure, so the caller can
+    report it alongside the deleted rows.
+    """
+    today = date.today()
+    cleared = 0
+    for account in session.execute(select(Account)).scalars():
+        if account.opening_balance:
+            account.opening_balance = money("0")
+            cleared += 1
+        account.opening_date = today
+    session.flush()
+    return cleared

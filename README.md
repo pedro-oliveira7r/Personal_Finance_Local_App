@@ -19,7 +19,7 @@ actually spend*.
 - [Installation](#installation)
 - [The database](#the-database)
 - [Launching the app](#launching-the-app)
-- [The nine screens](#the-nine-screens)
+- [The eight screens](#the-eight-screens)
 - [Key concepts](#key-concepts)
 - [Importing data](#importing-data)
 - [Exporting data](#exporting-data)
@@ -51,7 +51,8 @@ That is all. The script creates a virtual environment, installs the dependencies
 and opens the app at <http://localhost:8501>. On first launch it fills the database
 with 18 months of realistic demo data so nothing looks empty — clear it whenever you
 like from **Settings → Data → Clear all financial data**, and your accounts and
-categories are kept.
+categories are kept — emptied to a zero balance, so nothing of the demo's money is
+left behind.
 
 If you would rather drive it yourself:
 
@@ -141,22 +142,44 @@ PFA_DEMO=1 streamlit run app.py     # uses data/finance_demo.db instead
 
 ---
 
-## The nine screens
+## The eight screens
 
 | Screen | What it is for |
 |---|---|
-| **Dashboard** | The control centre: cash, net worth, savings rate, budget performance, alerts, forward projection |
-| **Budget planning** | Build a zero-based plan for one period, or generate a year at a time from rules |
+| **Dashboard** | The control centre: cash, net worth, savings rate, budget performance, dismissable alerts, forward projection and category trends |
+| **Budget planning** | Build a zero-based plan for one period from your recurring rules |
 | **Budget tracking** | Plan against reality line by line, plus a fast way to tick off what has happened |
-| **Transactions** | Enter, search, edit, transfer, import CSV, export, and restore from the recycle bin |
-| **Accounts** | Balances, net worth, manual valuations, interest accrual, category management |
-| **Goals & debts** | Targets with required monthly contributions; payoff projections and strategy comparison |
-| **Forecast** | Where the money is heading, with what-if scenarios and a net-worth outlook |
-| **Reports** | History, category trends, month-over-month and year-over-year, spending patterns, budget accuracy |
+| **Transactions** | Enter, search, edit, transfer (including across currencies), import CSV, export, and restore from the recycle bin |
+| **Accounts** | Balances, net worth, per-account currency, manual valuations, interest accrual, category management |
+| **Goals & debts** | Targets with required monthly contributions; payoff projections per debt |
+| **Forecast** | Where the money is heading, with a net-worth outlook |
 | **Settings** | Currency, period boundaries, income availability rules, thresholds, backup, data management |
 
 Colour is never the only signal: every status carries an icon and a number, and each
 chart has a **Show the numbers** table underneath it.
+
+### More than one currency
+
+A book can hold up to three currencies at once. Give each account its own currency, and
+transfers between accounts of different currencies ask for **both** amounts — what left
+and what arrived — so the effective rate, spread included, is recorded on the transfer.
+
+Each screen then gets a currency selector. Picking one shows that currency alone, with
+**nothing converted and nothing added across currencies**. Dashboard, Transactions,
+Accounts and Forecast also offer **All** — Forecast opens on it, since "how much will I
+have" is the question least served by one currency at a time. A combined view converts
+everything into your primary currency at the latest rate you entered, states the rate it
+used, and carries a per-currency breakdown so you can check it. Because conversion always
+uses the latest rate, **past periods move when you update one**.
+
+Budget planning, Budget tracking and Goals & debts are per-currency only: a converted
+"available to budget" is not a number you can hand out to categories, and a converted goal
+target is not what you are saving toward.
+
+The Dashboard carries the rate editor. A book with a single currency shows none of this —
+no selector, no rate box, exactly as before. The primary currency can only be changed
+while the book is still empty, because amounts are never converted and every stored rate
+is quoted against it.
 
 ---
 
@@ -271,6 +294,8 @@ Download a template from the same tab. Minimum columns: `date`, `description`,
 | Any report table as CSV | the download button under each table |
 | Complete JSON dump | Settings → Backup & restore |
 
+Money columns in the Excel workbook total per currency (`SUMIF`, not a single `SUM`), and a cross-currency transfer exports both legs and its rate.
+
 The Excel workbook has nine sheets — About, Transactions, Budget, History, Accounts,
 Goals, Debts, Net worth, Forecast — with live `SUM` and variance **formulas**, so it
 still adds up if you edit a figure in Excel.
@@ -323,11 +348,11 @@ python -m pytest
 | `test_recurrence.py` | Every frequency, growth anchoring, seasonality, settlement offsets, idempotent occurrence keys |
 | `test_cashflow.py` | Account balances, credit cards, transfers, all four availability rules, cross-period settlement |
 | `test_transactions.py` | Validation, duplicate protection, soft delete and undo, filtering, bulk operations |
-| `test_forecasting.py` | Period chaining, source precedence, earmarked money, scenarios, alerts |
-| `test_goals_debt.py` | Goal progress and required contributions, amortisation, payoff strategies, the never-pays-off case |
+| `test_forecasting.py` | Period chaining, source precedence, earmarked money, alerts |
+| `test_goals_debt.py` | Goal progress and required contributions, amortisation, the never-pays-off case |
 | `test_net_worth.py` | Asset/liability split, overdrawn accounts, history, projection, liquidity |
 | `test_financial_calculations.py` | End-to-end: budget generation, override survival, CSV round-trip, Excel export, backup/restore, migrations, demo data |
-| `test_ui_smoke.py` | Every one of the nine screens actually renders, against a populated database |
+| `test_ui_smoke.py` | Every one of the eight screens actually renders, against a populated database |
 | `test_theme.py` | Every colour pair the interface puts on screen clears its WCAG threshold in both modes; the palette reaches Streamlit's own theme; `config.toml` cannot drift from the palette or disable runtime theme switching |
 
 Edge cases are deliberate, not incidental: negative balances, missing income, leap
@@ -368,7 +393,7 @@ Financial-App/
 │   ├── cashflow.py           balances and income availability
 │   ├── forecasting.py        forward projection
 │   ├── goals.py              goal progress
-│   ├── debt.py               amortisation and payoff strategies
+│   ├── debt.py               amortisation and payoff projection
 │   └── net_worth.py          assets minus liabilities
 │
 ├── services/                 ORM ⟷ calculations; all reads and writes
@@ -564,12 +589,13 @@ interest. The Goals & debts screen shows the monthly interest figure; anything a
 it starts reducing the balance.
 
 **I want to start over.** Settings → Data → *Clear all financial data* keeps your
-accounts and categories; *Reset everything* restores factory defaults. Both need a
+accounts and categories but empties them, opening balances included, so every total
+reads zero; *Reset everything* restores factory defaults. Both need a
 typed confirmation, and both are worth a backup first.
 
 **Something crashed.** The stack trace names the file. `python -m pytest` will tell
 you whether the calculation layer or the interface is at fault; the UI smoke test
-covers all nine screens.
+covers all eight screens.
 
 ---
 

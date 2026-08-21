@@ -54,6 +54,10 @@ class AccountInfo:
     #: manual — property and market-priced holdings are re-valued, not summed.
     valuations: list[tuple[date, Decimal]] = field(default_factory=list)
     credit_limit: Optional[Decimal] = None
+    #: Denomination of every figure on this account. The maths layer stays
+    #: ORM-free, so this is the only way anything downstream can tell a real
+    #: from a euro — without it no aggregate can be currency-scoped at all.
+    currency: str = "BRL"
 
     def __post_init__(self) -> None:
         self.opening_balance = money(self.opening_balance)
@@ -109,9 +113,21 @@ class CashTxn:
     category_kind: Optional[str] = None
     exclude_from_budget: bool = False
     id: Optional[int] = None
+    #: For a cross-currency transfer, the magnitude arriving at
+    #: ``to_account_id``. ``None`` means both sides share a currency.
+    to_amount: Optional[Decimal] = None
+    #: Denomination of ``amount`` — the *source* account's currency.
+    currency: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.amount = money(self.amount)
+        if self.to_amount is not None:
+            self.to_amount = money(self.to_amount)
+
+    @property
+    def credited_amount(self) -> Decimal:
+        """What lands in ``to_account_id`` — the far leg of a transfer."""
+        return self.amount if self.to_amount is None else self.to_amount
 
     @property
     def effective_date(self) -> date:
@@ -135,6 +151,7 @@ def account_info_from_orm(account,
         balance_mode=account.balance_mode,
         valuations=list(valuations or []),
         credit_limit=account.credit_limit,
+        currency=account.currency,
     )
 
 
@@ -155,6 +172,8 @@ def cash_txn_from_orm(txn, category_kinds: Optional[Mapping[int, str]] = None) -
         category_id=txn.category_id,
         category_kind=kind,
         exclude_from_budget=txn.exclude_from_budget,
+        to_amount=txn.to_amount,
+        currency=getattr(getattr(txn, "account", None), "currency", None),
     )
 
 
@@ -305,10 +324,12 @@ def account_movement(
             if txn.account_id == account_id:
                 total -= txn.amount
         else:  # transfer
+            # The two legs are only the same magnitude when both accounts hold
+            # the same currency. Debit what left, credit what arrived.
             if txn.account_id == account_id:
                 total -= txn.amount
             if txn.to_account_id == account_id:
-                total += txn.amount
+                total += txn.credited_amount
     return money(total)
 
 
@@ -349,16 +370,33 @@ def balances_as_of(
     }
 
 
+def accounts_in(accounts: Sequence[AccountInfo],
+                currency: Optional[str] = None) -> list[AccountInfo]:
+    """Narrow a set of accounts to one currency.
+
+    ``None`` means no filter — the pre-multi-currency behaviour, and what keeps
+    every existing caller correct. Filtering here rather than at each sum is
+    what makes the whole downstream chain currency-scoped for free: the cash
+    pool, the opening balance and the transfer classification all derive from
+    this list.
+    """
+    if currency is None:
+        return list(accounts)
+    code = currency.upper()
+    return [info for info in accounts if (info.currency or "").upper() == code]
+
+
 def cash_available(
     accounts: Sequence[AccountInfo],
     txns: Sequence[CashTxn],
     on_date: Optional[date] = None,
     *,
     include_planned: bool = False,
+    currency: Optional[str] = None,
 ) -> Decimal:
     """Spendable cash: checking + savings + wallet, at a point in time."""
     total = ZERO
-    for info in accounts:
+    for info in accounts_in(accounts, currency):
         if not info.is_cash_like:
             continue
         total += account_balance(
@@ -426,8 +464,16 @@ def period_cashflow(
     first_day_of_month: int = 1,
     include_planned: bool = False,
     opening_override: Optional[Decimal] = None,
+    currency: Optional[str] = None,
 ) -> PeriodCashflow:
-    """Everything that happened (or is planned) inside one period."""
+    """Everything that happened (or is planned) inside one period.
+
+    Under a currency filter the cash pool contains only that currency's
+    accounts, so a transfer out to another currency reads as an outflow with no
+    matching inflow. That is the honest per-currency picture — the money really
+    did leave this pool — but it is worth saying so in the UI.
+    """
+    accounts = accounts_in(accounts, currency)
     cash_ids = {info.id for info in accounts if info.is_cash_like}
 
     opening = (
@@ -479,7 +525,7 @@ def period_cashflow(
                     elif target.is_liability:
                         flow.debt_paid = money(flow.debt_paid + txn.amount)
             elif to_cash and not from_cash:
-                flow.transfers_in = money(flow.transfers_in + txn.amount)
+                flow.transfers_in = money(flow.transfers_in + txn.credited_amount)
 
     flow.income_available = available_income_for_period(
         txns, period, availability_rule, cutoff_day=cutoff_day,
@@ -502,6 +548,7 @@ def cashflow_series(
     first_day_of_month: int = 1,
     today: Optional[date] = None,
     chain_opening: bool = True,
+    currency: Optional[str] = None,
 ) -> list[PeriodCashflow]:
     """Cash flow for a run of periods, chaining closing → opening balances.
 
@@ -509,6 +556,7 @@ def cashflow_series(
     planned transactions and are marked forecast.
     """
     today = today or date.today()
+    accounts = accounts_in(accounts, currency)
     results: list[PeriodCashflow] = []
     running: Optional[Decimal] = None
     for period in periods:
@@ -531,9 +579,12 @@ def carry_in_for_period(
     period: Period,
     accounts: Sequence[AccountInfo],
     txns: Sequence[CashTxn],
+    *,
+    currency: Optional[str] = None,
 ) -> Decimal:
     """Cash on hand the moment the period opens (completed movements only)."""
-    return cash_available(accounts, txns, period.start - timedelta(days=1))
+    return cash_available(accounts, txns, period.start - timedelta(days=1),
+                          currency=currency)
 
 
 def upcoming_outflows(

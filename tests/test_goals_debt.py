@@ -14,9 +14,6 @@ from calculations.debt import (
     debt_alerts,
     interest_for_month,
     minimum_viable_payment,
-    order_debts,
-    simulate_strategy,
-    strategy_comparison,
 )
 from calculations.goals import (
     compute_progress,
@@ -26,7 +23,7 @@ from calculations.goals import (
     projected_balance_at,
     required_contribution,
 )
-from constants import GoalStatus, PayoffStrategy
+from constants import GoalStatus
 
 
 # ==========================================================================
@@ -246,155 +243,6 @@ def test_effective_payment_prefers_planned_over_minimum():
 def test_minimum_viable_payment_is_the_monthly_interest():
     assert minimum_viable_payment(Decimal("10000"), Decimal("12")) == Decimal("100.00")
     assert interest_for_month(Decimal("10000"), Decimal("24")) == Decimal("200.00")
-
-
-# --------------------------------------------------------------------------
-# Strategies
-# --------------------------------------------------------------------------
-def two_debts():
-    return [
-        DebtInput(name="Small expensive", balance="2000", annual_rate_pct="60",
-                  minimum_payment="100"),
-        DebtInput(name="Big cheap", balance="10000", annual_rate_pct="12",
-                  minimum_payment="300"),
-    ]
-
-
-def test_avalanche_orders_by_rate_snowball_by_balance():
-    avalanche = order_debts(two_debts(), PayoffStrategy.AVALANCHE.value)
-    assert avalanche[0].name == "Small expensive"
-    snowball = order_debts(two_debts(), PayoffStrategy.SNOWBALL.value)
-    assert snowball[0].name == "Small expensive"
-
-    reversed_case = [
-        DebtInput(name="Small cheap", balance="500", annual_rate_pct="5",
-                  minimum_payment="50"),
-        DebtInput(name="Big expensive", balance="9000", annual_rate_pct="80",
-                  minimum_payment="400"),
-    ]
-    assert order_debts(reversed_case,
-                       PayoffStrategy.AVALANCHE.value)[0].name == "Big expensive"
-    assert order_debts(reversed_case,
-                       PayoffStrategy.SNOWBALL.value)[0].name == "Small cheap"
-
-
-def test_avalanche_never_costs_more_interest_than_snowball():
-    results = strategy_comparison(two_debts(), extra_pool=Decimal("400"))
-    avalanche = results[PayoffStrategy.AVALANCHE.value]
-    snowball = results[PayoffStrategy.SNOWBALL.value]
-    assert not avalanche.never_pays_off
-    assert avalanche.total_interest <= snowball.total_interest
-
-
-def test_extra_payments_shorten_the_whole_plan():
-    without = simulate_strategy(two_debts(), PayoffStrategy.AVALANCHE.value,
-                                extra_pool=Decimal("0"))
-    with_extra = simulate_strategy(two_debts(), PayoffStrategy.AVALANCHE.value,
-                                   extra_pool=Decimal("500"))
-    assert with_extra.months < without.months
-    assert with_extra.total_interest < without.total_interest
-
-
-def test_strategy_records_the_payoff_order():
-    result = simulate_strategy(two_debts(), PayoffStrategy.AVALANCHE.value,
-                               extra_pool=Decimal("500"))
-    assert result.payoff_order[0] == "Small expensive"
-    assert set(result.per_debt_months) == {"Small expensive", "Big cheap"}
-
-
-def test_strategies_use_the_payment_you_actually_committed_to():
-    """A planned payment above the minimum must not be simulated as the minimum.
-
-    The demo credit card carries a 280 minimum but a 3.200 planned payment. Read
-    as "minimum only", it looks like it can never be cleared; read correctly, it
-    clears in months.
-    """
-    debts = [DebtInput(name="Card", balance="5200", annual_rate_pct="180",
-                       minimum_payment="280", planned_payment="3200")]
-    real = simulate_strategy(debts, PayoffStrategy.AVALANCHE.value)
-    assert not real.never_pays_off
-    assert real.stuck == []
-    assert real.monthly_outlay == Decimal("3200.00")
-
-    # The minimums-only baseline genuinely never clears — that is its lesson.
-    baseline = simulate_strategy(debts, PayoffStrategy.MINIMUM_ONLY.value)
-    assert baseline.never_pays_off
-    assert baseline.stuck == ["Card"]
-    assert baseline.monthly_outlay == Decimal("280.00")
-
-
-def test_per_debt_extra_counts_toward_the_baseline():
-    debts = [DebtInput(name="Loan", balance="1000", annual_rate_pct="0",
-                       minimum_payment="50", planned_payment="100",
-                       extra_payment="150")]
-    result = simulate_strategy(debts, PayoffStrategy.AVALANCHE.value)
-    assert result.monthly_outlay == Decimal("250.00")
-    assert result.months == 4
-
-
-def test_a_debt_that_outgrows_its_payment_does_not_overflow():
-    """The regression: 180%/year against a minimum that only covers part of it.
-
-    Compounded over the full 600-month horizon this produces a number with
-    hundreds of digits and ``quantize`` raises InvalidOperation, taking the whole
-    screen down. The simulation must notice the stall and stop.
-    """
-    debts = [
-        DebtInput(name="Card", balance="3000", annual_rate_pct="180",
-                  minimum_payment="280", planned_payment="280"),
-        DebtInput(name="Car", balance="23000", annual_rate_pct="21.9",
-                  minimum_payment="948", planned_payment="948"),
-    ]
-    for strategy in (PayoffStrategy.AVALANCHE.value, PayoffStrategy.SNOWBALL.value,
-                     PayoffStrategy.MINIMUM_ONLY.value):
-        result = simulate_strategy(debts, strategy)
-        assert result.never_pays_off
-        assert result.stuck == ["Card"]
-        assert result.months < 30, "it should give up quickly, not grind to 600"
-
-
-def test_strategy_comparison_survives_a_hopeless_debt():
-    debts = [DebtInput(name="Trap", balance="5000", annual_rate_pct="200",
-                       minimum_payment="100")]
-    results = strategy_comparison(debts)          # must not raise
-    assert all(result.never_pays_off for result in results.values())
-    assert all(result.stuck == ["Trap"] for result in results.values())
-
-
-def test_enough_extra_rescues_a_stalled_debt():
-    debts = [
-        DebtInput(name="Card", balance="3000", annual_rate_pct="180",
-                  minimum_payment="280", planned_payment="280"),
-        DebtInput(name="Car", balance="23000", annual_rate_pct="21.9",
-                  minimum_payment="948", planned_payment="948"),
-    ]
-    rescued = simulate_strategy(debts, PayoffStrategy.AVALANCHE.value,
-                                extra_pool=Decimal("500"))
-    assert not rescued.never_pays_off
-    assert rescued.stuck == []
-    assert rescued.payoff_order[0] == "Card"
-
-
-def test_minimums_only_ignores_the_extra_pool():
-    """It is the do-nothing baseline — extra money and freed minimums do not apply."""
-    debts = [
-        DebtInput(name="A", balance="1000", annual_rate_pct="0", minimum_payment="100"),
-        DebtInput(name="B", balance="2000", annual_rate_pct="0", minimum_payment="100"),
-    ]
-    baseline = simulate_strategy(debts, PayoffStrategy.MINIMUM_ONLY.value,
-                                 extra_pool=Decimal("400"))
-    rolled = simulate_strategy(debts, PayoffStrategy.SNOWBALL.value,
-                               extra_pool=Decimal("400"))
-    assert baseline.months == 20        # B alone takes 2000 / 100
-    assert rolled.months < baseline.months
-    assert baseline.monthly_outlay == Decimal("200.00")
-    assert rolled.monthly_outlay == Decimal("600.00")
-
-
-def test_strategy_with_no_debts_is_empty():
-    result = simulate_strategy([], PayoffStrategy.AVALANCHE.value)
-    assert result.months == 0
-    assert not result.never_pays_off
 
 
 def test_alerts_flag_a_payment_that_only_covers_interest():

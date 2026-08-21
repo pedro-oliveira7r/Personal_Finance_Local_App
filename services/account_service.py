@@ -142,6 +142,18 @@ def update_account(session: Session, account_id: int, payload: dict[str, Any]) -
     clash = find_by_name(session, data.name)
     if clash is not None and clash.id != account_id:
         raise ConflictError(f"Another account is already called “{data.name}”.")
+    if data.currency != account.currency:
+        # Amounts are stored as bare integer cents. Re-denominating an account
+        # would silently reinterpret every existing figure as the new currency
+        # without converting a thing — 1.000 reais becoming 1.000 euros.
+        moved = usage_count(session, account_id)["transactions"]
+        if moved:
+            raise ConflictError(
+                f"“{account.name}” already holds {moved} transaction(s) in "
+                f"{account.currency}. Changing its currency would re-label them "
+                f"all without converting anything. Create a new account in "
+                f"{data.currency} instead."
+            )
     apply_fields(account, data.model_dump())
     session.flush()
     return account
@@ -231,10 +243,21 @@ class AccountTotals:
     credit_limit: Decimal = ZERO
 
 
-def totals(views: Sequence[AccountBalanceView]) -> AccountTotals:
+def totals(views: Sequence[AccountBalanceView],
+           currency: Optional[str] = None) -> AccountTotals:
+    """Roll a set of accounts into headline figures.
+
+    ``currency`` narrows to one denomination. ``None`` means no filter, which
+    is the pre-multi-currency behaviour and correct for a single-currency book;
+    on a mixed book an unfiltered call adds reais to euros, so every UI caller
+    passes a code or uses :func:`totals_by_currency`.
+    """
+    code = currency.upper() if currency else None
     result = AccountTotals()
     for view in views:
         if not view.account.include_in_net_worth:
+            continue
+        if code is not None and (view.account.currency or "").upper() != code:
             continue
         if view.is_liability:
             result.liabilities = money(result.liabilities + view.display_balance)
@@ -252,6 +275,22 @@ def totals(views: Sequence[AccountBalanceView]) -> AccountTotals:
                 result.savings = money(result.savings + view.balance)
     result.net_worth = money(result.assets - result.liabilities)
     return result
+
+
+def totals_by_currency(
+        views: Sequence[AccountBalanceView]) -> dict[str, AccountTotals]:
+    """One :class:`AccountTotals` per currency present, primary order aside.
+
+    Partitions a single ``balance_views`` result rather than re-querying per
+    currency — ``balance_views`` loads every transaction in the book, so the
+    loop would be the expensive way to ask the same question.
+    """
+    codes: list[str] = []
+    for view in views:
+        code = (view.account.currency or "").upper()
+        if code and code not in codes:
+            codes.append(code)
+    return {code: totals(views, code) for code in codes}
 
 
 def cash_accounts(session: Session) -> list[Account]:

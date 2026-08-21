@@ -101,6 +101,7 @@ def get_or_create_settings(session: Session) -> AppSettings:
         settings = AppSettings(
             id=1,
             base_currency=defaults["base_currency"],
+            active_currencies=list(defaults["active_currencies"]),
             date_format=defaults["date_format"],
             show_cents=defaults["show_cents"],
             first_day_of_month=defaults["first_day_of_month"],

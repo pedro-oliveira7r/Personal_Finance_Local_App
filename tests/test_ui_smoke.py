@@ -2,7 +2,7 @@
 
 This is the test that would have caught a typo in a page module — it actually
 executes ``app.py`` through Streamlit's own test harness and fails on any
-uncaught exception, for every one of the nine sections.
+uncaught exception, for every one of the eight sections.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ PAGE_LABELS = [
     "🏦  Accounts",
     "🚩  Goals & debts",
     "🔮  Forecast",
-    "📈  Reports",
     "⚙️  Settings",
 ]
 
@@ -248,7 +247,10 @@ def test_no_markdown_call_carries_two_bare_money_values():
 
     markdown_calls = {"markdown", "caption", "write", "info", "warning",
                       "error", "success", "toast"}
-    symbol_producing = {"money", "signed_money", "format_money"}
+    # ``symbol`` and ``symbol_for`` return a bare currency symbol, so two of
+    # them in one markdown block trip the same LaTeX rule as two amounts.
+    symbol_producing = {"money", "signed_money", "format_money",
+                        "symbol", "symbol_for"}
     escaping = {"md", "md_money"}
 
     def bare_amounts(node) -> int:

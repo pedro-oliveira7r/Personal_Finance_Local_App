@@ -58,6 +58,7 @@ def ensure_dirs() -> None:
 # --------------------------------------------------------------------------
 DEFAULT_SETTINGS = {
     "base_currency": "BRL",
+    "active_currencies": ["BRL"],
     "date_format": "DD/MM/YYYY",
     "decimal_places": 2,
     "first_day_of_month": 1,

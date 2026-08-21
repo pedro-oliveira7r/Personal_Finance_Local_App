@@ -17,7 +17,6 @@ from charts.theme import (
     empty_figure,
     fold_to_other,
     line_marker,
-    money_text,
     truncate,
 )
 
@@ -139,43 +138,6 @@ def spending_heatmap(rows: Sequence[dict], theme: ChartTheme, *,
     layout = base_layout(theme, height=height, title=title, show_legend=False,
                          money_axis=None)
     layout["margin"]["l"] = 4
-    fig.update_layout(**layout)
-    return fig
-
-
-def comparison_bars(metrics: dict, theme: ChartTheme, *, height: int = 300,
-                    title: Optional[str] = None,
-                    previous_label: str = "Previous",
-                    current_label: str = "Current") -> go.Figure:
-    """Two-period comparison across the headline metrics."""
-    if not metrics:
-        return empty_figure(theme, "Not enough history to compare yet.", height)
-    keys = [key for key in ("income", "expenses", "savings", "investments", "debt_payments")
-            if key in metrics]
-    if not keys:
-        return empty_figure(theme, "Not enough history to compare yet.", height)
-
-    names = {"income": "Income", "expenses": "Expenses", "savings": "Savings",
-             "investments": "Investments", "debt_payments": "Debt payments"}
-    labels = [names[key] for key in keys]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=labels, y=[to_float(metrics[key]["previous"]) for key in keys],
-        name=previous_label, marker=bar_marker(theme, theme.series(3)),
-        text=money_text([metrics[key]["previous"] for key in keys], theme.currency),
-        textposition="outside", textfont={"size": 10, "color": theme.text_secondary},
-        hovertemplate=previous_label + ": " + theme.tick_prefix + "%{y:,.2f}<extra>%{x}</extra>",
-    ))
-    fig.add_trace(go.Bar(
-        x=labels, y=[to_float(metrics[key]["current"]) for key in keys],
-        name=current_label, marker=bar_marker(theme, theme.series(0)),
-        text=money_text([metrics[key]["current"] for key in keys], theme.currency),
-        textposition="outside", textfont={"size": 10, "color": theme.text_secondary},
-        hovertemplate=current_label + ": " + theme.tick_prefix + "%{y:,.2f}<extra>%{x}</extra>",
-    ))
-    layout = base_layout(theme, height=height, title=title)
-    layout["barmode"] = "group"
-    layout["bargap"] = 0.3
     fig.update_layout(**layout)
     return fig
 
@@ -332,132 +294,5 @@ def amortisation_split_bars(schedule: Sequence, theme: ChartTheme, *,
     layout = base_layout(theme, height=height, title=title)
     layout["barmode"] = "stack"
     layout["bargap"] = 0.2
-    fig.update_layout(**layout)
-    return fig
-
-
-def strategy_comparison_bars(results: dict, theme: ChartTheme, *, height: int = 280,
-                             title: Optional[str] = None) -> go.Figure:
-    """Total interest paid under each payoff strategy. One measure, one axis."""
-    usable = {name: result for name, result in results.items()
-              if not result.never_pays_off and result.months}
-    if not usable:
-        return empty_figure(
-            theme,
-            "At least one debt never gets paid off at the current payment — "
-            "raise it above the monthly interest first.",
-            height,
-        )
-    names = {"avalanche": "Avalanche (highest rate first)",
-             "snowball": "Snowball (smallest balance first)",
-             "minimum_only": "Minimums only"}
-    labels = [names.get(key, key) for key in usable]
-    fig = go.Figure(go.Bar(
-        x=labels, y=[to_float(result.total_interest) for result in usable.values()],
-        marker={"color": theme.colors(len(usable)), "cornerradius": 4,
-                "line": {"color": theme.surface, "width": 2}},
-        text=[f"{format_money(result.total_interest, theme.currency, compact=True)} · "
-              f"{result.months} mo" for result in usable.values()],
-        textposition="outside", textfont={"size": 10, "color": theme.text_secondary},
-        hovertemplate="%{x}<br>Interest: " + theme.tick_prefix + "%{y:,.2f}<extra></extra>",
-    ))
-    layout = base_layout(theme, height=height, title=title, show_legend=False)
-    fig.update_layout(**layout)
-    return fig
-
-
-# --------------------------------------------------------------------------
-# Forecast
-# --------------------------------------------------------------------------
-def forecast_components_bars(rows: Sequence, theme: ChartTheme, *, height: int = 340,
-                             title: Optional[str] = None) -> go.Figure:
-    """Projected income against the components of projected outflow."""
-    if not rows:
-        return empty_figure(theme, "Nothing to forecast yet.", height)
-    labels = [row.label for row in rows]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=labels, y=[to_float(row.assumption.income) for row in rows],
-        name="Income", marker=bar_marker(theme, theme.series(2)),
-        hovertemplate="Income: " + theme.tick_prefix + "%{y:,.2f}<extra>%{x}</extra>",
-    ))
-    for name, attr, slot in (("Expenses", "expenses", 1),
-                             ("Investments", "investments", 6),
-                             ("Debt payments", "debt_payments", 7),
-                             ("Savings (moved out)", "savings_outflow", 4)):
-        values = [to_float(getattr(row.assumption, attr)) for row in rows]
-        if not any(values):
-            continue
-        fig.add_trace(go.Bar(
-            x=labels, y=values, name=name,
-            marker=bar_marker(theme, theme.series(slot)),
-            offsetgroup="out", base=None,
-            hovertemplate=name + ": " + theme.tick_prefix + "%{y:,.2f}<extra>%{x}</extra>",
-        ))
-    layout = base_layout(theme, height=height, title=title)
-    layout["barmode"] = "stack"
-    layout["bargap"] = 0.3
-    fig.update_layout(**layout)
-    return fig
-
-
-def scenario_comparison_line(base_rows: Sequence, scenario_rows: Sequence,
-                             theme: ChartTheme, *, height: int = 340,
-                             scenario_name: str = "Scenario",
-                             title: Optional[str] = None) -> go.Figure:
-    """Baseline projection against a what-if, on the same axis."""
-    if not base_rows:
-        return empty_figure(theme, "Build a forecast first.", height)
-    labels = [row.label for row in base_rows]
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=labels, y=[to_float(row.closing_cash) for row in base_rows],
-        name="Baseline", mode="lines+markers",
-        line=line_marker(theme, theme.series(0)),
-        marker={"size": 7, "line": {"color": theme.surface, "width": 2}},
-        hovertemplate="Baseline: " + theme.tick_prefix + "%{y:,.2f}<extra>%{x}</extra>",
-    ))
-    if scenario_rows:
-        fig.add_trace(go.Scatter(
-            x=[row.label for row in scenario_rows],
-            y=[to_float(row.closing_cash) for row in scenario_rows],
-            name=scenario_name, mode="lines+markers",
-            line=line_marker(theme, theme.series(1), dash="dash"),
-            marker={"size": 7, "symbol": "diamond",
-                    "line": {"color": theme.surface, "width": 2}},
-            hovertemplate=(scenario_name + ": " + theme.tick_prefix +
-                           "%{y:,.2f}<extra>%{x}</extra>"),
-        ))
-    layout = base_layout(theme, height=height, title=title)
-    layout["hovermode"] = "x unified"
-    fig.update_layout(**layout)
-    fig.add_hline(y=0, line_width=1, line_color=theme.axis)
-    return fig
-
-
-def budget_accuracy_bars(rows: Sequence[dict], theme: ChartTheme, *, height: int = 300,
-                         title: Optional[str] = None) -> go.Figure:
-    """How realistic past budgets were — 100% means the plan matched reality."""
-    if not rows:
-        return empty_figure(theme, "Close a few periods to measure budget accuracy.", height)
-    labels = [row["label"] for row in rows]
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=labels, y=[to_float(row["income_accuracy"]) for row in rows],
-        name="Income plan accuracy", marker=bar_marker(theme, theme.series(2)),
-        hovertemplate="Income accuracy: %{y:.1f}%<extra>%{x}</extra>",
-    ))
-    fig.add_trace(go.Bar(
-        x=labels, y=[to_float(row["expense_accuracy"]) for row in rows],
-        name="Spending plan accuracy", marker=bar_marker(theme, theme.series(0)),
-        hovertemplate="Spending accuracy: %{y:.1f}%<extra>%{x}</extra>",
-    ))
-    layout = base_layout(theme, height=height, title=title)
-    layout["barmode"] = "group"
-    layout["bargap"] = 0.3
-    layout["yaxis"]["ticksuffix"] = "%"
-    layout["yaxis"]["tickprefix"] = ""
-    layout["yaxis"]["range"] = [0, 105]
-    layout["yaxis"]["showgrid"] = True
     fig.update_layout(**layout)
     return fig

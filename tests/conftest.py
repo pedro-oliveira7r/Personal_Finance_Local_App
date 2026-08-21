@@ -95,3 +95,20 @@ def categories(session):
 @pytest.fixture()
 def D():
     return Decimal
+
+
+@pytest.fixture()
+def eur_book(session):
+    """A two-currency book: BRL primary, EUR at 6.20, plus a euro account."""
+    from constants import AccountType
+    from services import account_service, currency_service
+
+    currency_service.set_active_currencies(session, ["EUR"])
+    currency_service.set_rate(session, "EUR", "6.20", as_of=date(2026, 8, 1))
+    account = account_service.create_account(session, {
+        "name": "Euro savings", "type": AccountType.SAVINGS.value,
+        "currency": "EUR", "opening_balance": "0",
+        "opening_date": date(2026, 1, 1), "include_in_cash": True,
+    })
+    session.commit()
+    return {"account": account, "book": currency_service.book(session)}

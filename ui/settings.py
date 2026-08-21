@@ -456,7 +456,9 @@ def _data() -> None:
             "🗑 Clear all financial data", "clear_data",
             prompt="Delete every transaction, budget, rule, goal, debt and snapshot? "
                    "Your accounts and categories are kept so you can start clean "
-                   "without rebuilding your setup. This cannot be undone.",
+                   "without rebuilding your setup — but the accounts are emptied, "
+                   "opening balances included, so every total reads zero. "
+                   "This cannot be undone.",
             confirm_label="Clear it all", require_text="CLEAR",
             **ui.wide(),
         ):
@@ -468,9 +470,12 @@ def _data() -> None:
             counts = ui.run_action(action, rerun=False,
                                    spinner="Clearing…")
             if counts is not None:
+                emptied = counts.pop("account_balances", 0)
                 total = sum(counts.values())
-                ui.flash(f"{total} record(s) removed. Accounts and categories kept.",
-                         "warning")
+                note = (f" {emptied} account balance(s) reset to zero."
+                        if emptied else "")
+                ui.flash(f"{total} record(s) removed. Accounts and categories kept."
+                         + note, "warning")
                 st.rerun()
     with columns[1]:
         if ui.confirm_action(
